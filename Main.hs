@@ -6,49 +6,49 @@ import Control.Monad.ST
 import Data.STRef
 
 
-newtype Pending s = Pending { unPending :: [Pending s] -> ST s () }
-newtype RTSM s a = RTSM { unRTSM :: (a -> Pending s) -> Pending s }
+newtype Pending s r = Pending { unPending :: [Pending s r] -> ST s r }
+newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Pending s r }
 
-runRTSM :: (forall s. RTSM s a) -> () -- TODO: figure out a way of returning data that still lets me write a type for the [Pending s] list in RTSVar
-runRTSM mx = runST (unPending (unRTSM mx (\_x -> Pending $ \_pendings -> return ())) [])
+runRTSM :: (forall s. RTSM s r r) -> r
+runRTSM mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings -> return x)) [])
 
 
-instance Functor (RTSM s) where
+instance Functor (RTSM s r) where
     fmap = liftM
 
-instance Monad (RTSM s) where
+instance Monad (RTSM s r) where
     return x = RTSM $ \k -> k x
     mx >>= fxmy = RTSM $ \k_y -> Pending $ \pendings -> unPending (unRTSM mx (\x -> unRTSM (fxmy x) k_y)) pendings
 
-yield :: RTSM s ()
+yield :: RTSM s r ()
 yield = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : pendings)
 
-scheduleM :: [Pending s] -> ST s ()
+scheduleM :: [Pending s r] -> ST s r
 scheduleM pendings = case schedule pendings of (pending, pendings) -> unPending pending pendings
 
-schedule :: [Pending s] -> (Pending s, [Pending s])
+schedule :: [Pending s r] -> (Pending s r, [Pending s r])
 schedule [] = error "Blocked indefinitely!"
 schedule xs = (last xs, init xs) -- Round robin scheduling (poor mans queue)
 
 
-data RTSVarState s a = RTSVarState {
+data RTSVarState s r a = RTSVarState {
     rtsvar_data :: Maybe a,
-    rtsvar_putters :: [Pending s],
-    rtsvar_takers :: [Pending s]
+    rtsvar_putters :: [Pending s r],
+    rtsvar_takers :: [Pending s r]
   }
 
-newtype RTSVar s a = RTSVar { unRTSVar :: STRef s (RTSVarState s a) }
+newtype RTSVar s r a = RTSVar { unRTSVar :: STRef s (RTSVarState s r a) }
 
-newEmptyRTSVar :: RTSM s (RTSVar s a)
+newEmptyRTSVar :: RTSM s r (RTSVar s r a)
 newEmptyRTSVar = newRTSVarInternal Nothing
 
-newRTSVar :: a -> RTSM s (RTSVar s a)
+newRTSVar :: a -> RTSM s r (RTSVar s r a)
 newRTSVar = newRTSVarInternal . Just
 
-newRTSVarInternal :: Maybe a -> RTSM s (RTSVar s a)
+newRTSVarInternal :: Maybe a -> RTSM s r (RTSVar s r a)
 newRTSVarInternal mb_x = RTSM $ \k -> Pending $ \pendings -> newSTRef (RTSVarState mb_x [] []) >>= \stref -> unPending (k (RTSVar stref)) pendings
 
-takeRTSVar :: RTSVar s a -> RTSM s a
+takeRTSVar :: RTSVar s r a -> RTSM s r a
 takeRTSVar rtsvar = RTSM try_again
   where
     try_again k = Pending $ \pendings -> do
@@ -58,7 +58,7 @@ takeRTSVar rtsvar = RTSM try_again
             where (mb_wake_putter, putters') = unCons (rtsvar_putters state) -- TODO: non-FCFS strategies?
           Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = try_again k : rtsvar_takers state }) >> scheduleM pendings
 
-putRTSVar :: RTSVar s a -> a -> RTSM s ()
+putRTSVar :: RTSVar s r a -> a -> RTSM s r ()
 putRTSVar rtsvar x = RTSM try_again
   where
     try_again k = Pending $ \pendings -> do
@@ -74,4 +74,11 @@ unCons (x:xs) = (Just x,  xs)
 
 
 main :: IO ()
-main = return ()
+main = print $ runRTSM $ do
+    yield
+    v <- newEmptyRTSVar
+    --putRTSVar v 3
+    putRTSVar v 3
+    yield
+    --takeRTSVar v
+    takeRTSVar v
