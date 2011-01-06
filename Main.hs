@@ -42,7 +42,7 @@ data RTSVarState s r a = RTSVarState {
     rtsvar_takers :: Queue (Pending s r)
   }
 
-newtype RTSVar s r a = RTSVar { unRTSVar :: STRef s (RTSVarState s r a) }
+newtype RTSVar s r a = RTSVar { unRTSVar :: STRef s (RTSVarState s r a) } -- TODO: I could detect more unreachable states if I find that a RTSVar currently blocking a Pending gets GCed
 
 newEmptyRTSVar :: RTSM s r (RTSVar s r a)
 newEmptyRTSVar = newRTSVarInternal Nothing
@@ -59,7 +59,7 @@ takeRTSVar rtsvar = RTSM try_again
     try_again k = Pending $ \pendings -> do
         state <- readSTRef (unRTSVar rtsvar)
         case rtsvar_data state of
-           -- TODO: we must guarantee that the woken thread completes its takeRTSVar operation since takeMVar does
+           -- TODO: we must guarantee that the woken thread doing a putRTSVar (if any) completes its operation since takeMVar has this guarantee
           Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = Nothing, rtsvar_putters = putters' }) >> unPending (k x) (maybe id (:) mb_wake_putter pendings)
             where (mb_wake_putter, putters') = dequeue1 (rtsvar_putters state)
           Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue (try_again k) (rtsvar_takers state) }) >> scheduleM pendings
@@ -70,7 +70,7 @@ putRTSVar rtsvar x = RTSM try_again
     try_again k = Pending $ \pendings -> do
         state <- readSTRef (unRTSVar rtsvar)
         case rtsvar_data state of
-           -- TODO: we must guarantee that the woken thread completes its putRTSVar operation since takeMVar does
+           -- TODO: we must guarantee that the woken thread doing a takeRTSVar (if any) completes its operation since putMVar has this guarantee
           Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = Just x, rtsvar_takers = takers' }) >> unPending (k ()) (maybe id (:) mb_wake_taker pendings)
             where (mb_wake_taker, takers') = dequeue1 (rtsvar_takers state)
           Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (try_again k) (rtsvar_putters state) } ) >> scheduleM pendings
