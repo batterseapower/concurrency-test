@@ -1,15 +1,19 @@
 {-# LANGUAGE Rank2Types, GeneralizedNewtypeDeriving #-}
 
 import Control.Arrow ((***), first, second)
+import Control.Applicative (Applicative(..))
+import Control.Monad
 import Control.Exception
 
-import Control.Monad
 import Control.Monad.ST
 import Data.STRef
 import Data.List
+import Data.Monoid (mempty)
+import Data.Foldable (Foldable(foldMap))
+import Data.Traversable (Traversable(traverse))
 
 import Test.LazySmallCheck
-import Test.QuickCheck hiding ((><))
+import Test.QuickCheck hiding (Success, Result, (><))
 import Test.QuickCheck.Gen
 
 import System.Random
@@ -21,6 +25,10 @@ import Debug.Trace
 
 import System.IO.Unsafe
 
+
+instance Applicative (ST s) where
+    pure = return
+    (<*>) = ap
 
 instance Arbitrary StdGen where
     arbitrary = MkGen $ \gen _ -> gen
@@ -151,25 +159,25 @@ genericDeleteAt []     _ = error $ "genericDeleteAt: index too large for given l
 genericDeleteAt (x:xs) n = if n == 0 then (x, xs) else second (x:) (genericDeleteAt xs (n - 1))
 
 
-newtype Scheduler = Scheduler { schedule :: forall s r. [Pending s r] -> (Scheduler, Pending s r, [Pending s r]) }
+newtype Scheduler = Scheduler { schedule :: forall s r. [Pending s r] -> Result (Scheduler, Pending s r, [Pending s r]) }
 
 unfair :: Scheduler
 unfair = Scheduler schedule
   where
-    schedule []     = error "Blocked indefinitely!"
-    schedule (x:xs) = (unfair, x, xs)
+    schedule []     = BlockedIndefinitely
+    schedule (x:xs) = Success (unfair, x, xs)
 
 roundRobin :: Scheduler
 roundRobin = Scheduler schedule
   where
-    schedule [] = error "Blocked indefinitely!"
-    schedule xs = (roundRobin, last xs, init xs)
+    schedule [] = BlockedIndefinitely
+    schedule xs = Success (roundRobin, last xs, init xs)
 
 streamed :: Stream Nat -> Scheduler
 streamed (i :< is) = Scheduler schedule
   where
-    schedule [] = error "Blocked indefinitely!"
-    schedule xs = (streamed is, x, xs')
+    schedule [] = BlockedIndefinitely
+    schedule xs = Success (streamed is, x, xs')
       where 
         n = i `mod` genericLength xs -- A bit unsatisfactory because I really want a uniform chance of scheduling the available threads
         (x, xs') = genericDeleteAt xs n
@@ -177,8 +185,8 @@ streamed (i :< is) = Scheduler schedule
 schedulerStreemed :: SchedulerStreem -> Scheduler
 schedulerStreemed (SS sss) = Scheduler schedule
   where
-    schedule [] = error "Blocked indefinitely!"
-    schedule xs = (schedulerStreemed (SS sss'), x, xs')
+    schedule [] = BlockedIndefinitely
+    schedule xs = Success (schedulerStreemed (SS sss'), x, xs')
       where
         Streem n sss' = genericIndexStream sss (genericLength xs - 1 :: Nat)
         (x, xs') = genericDeleteAt xs n
@@ -186,8 +194,8 @@ schedulerStreemed (SS sss) = Scheduler schedule
 randomised :: StdGen -> Scheduler
 randomised gen = Scheduler schedule
   where
-    schedule [] = error "Blocked indefinitely!"
-    schedule xs = (randomised gen', x, xs')
+    schedule [] = BlockedIndefinitely
+    schedule xs = Success (randomised gen', x, xs')
       where
         (n, gen') = randomR (0, length xs - 1) gen
         (x, xs') = genericDeleteAt xs n
@@ -199,20 +207,49 @@ instance Serial Scheduler where
     series = cons schedulerStreemed >< series
 
 
+data Result a = Success a
+              | BlockedIndefinitely
+              deriving (Eq, Show)
+
+instance Functor Result where
+    fmap = liftM
+
+instance Applicative Result where
+    pure = return
+    (<*>) = ap
+
+instance Monad Result where
+    return = Success
+    Success x           >>= f = f x
+    BlockedIndefinitely >>= f = BlockedIndefinitely
+
+instance Foldable Result where
+    foldMap f (Success x)         = f x
+    foldMap _ BlockedIndefinitely = mempty
+
+instance Traversable Result where
+    traverse f (Success x)         = pure Success <*> f x
+    traverse _ BlockedIndefinitely = pure BlockedIndefinitely
+
+
 -- | A pending coroutine
 --
 -- You almost always want to use (scheduleM (k : pendings)) rather than (unPending k pendings) because
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
-newtype Pending s r = Pending { unPending :: [Pending s r] -> Scheduler -> ST s r }
+newtype Pending s r = Pending { unPending :: [Pending s r] -> Scheduler -> ST s (Result r) }
 newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Pending s r }
 
-runRTSM :: Scheduler -> (forall s. RTSM s r r) -> r
-runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _scheduler -> return x)) [] scheduler)
+runRTSM :: Scheduler -> (forall s. RTSM s r r) -> Result r
+runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _scheduler -> return (Success x))) [] scheduler)
 
 
 instance Functor (RTSM s r) where
     fmap = liftM
+
+instance Applicative (RTSM s r) where
+   pure = return
+   (<*>) = ap
 
 instance Monad (RTSM s r) where
     return x = RTSM $ \k -> k x
@@ -227,8 +264,8 @@ instance Monad (RTSM s r) where
 yield :: RTSM s r ()
 yield = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : pendings)
 
-scheduleM :: [Pending s r] -> Scheduler -> ST s r
-scheduleM pendings scheduler = case schedule scheduler pendings of (scheduler, pending, pendings) -> unPending pending pendings scheduler
+scheduleM :: [Pending s r] -> Scheduler -> ST s (Result r)
+scheduleM pendings scheduler = fmap join $ traverse (\(scheduler, pending, pendings) -> unPending pending pendings scheduler) (schedule scheduler pendings)
 
 
 fork :: RTSM s r () -> RTSM s r ()
