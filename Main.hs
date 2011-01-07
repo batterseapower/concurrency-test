@@ -23,6 +23,19 @@ import Prelude hiding (catch)
 exceptionTrace :: a -> a
 exceptionTrace x = unsafePerformIO (evaluate x `catch` (\e -> trace ("Exception in pure code: " ++ show (e :: SomeException)) $ throw e))
 
+-- I used to use unsafeIsEvaluated to decide where to put in "...", but that pruned too heavily because
+-- I couldn't show the schedule before it was actually poked on and those thunks turned into real values.
+{-# NOINLINE showExplored #-}
+showExplored :: (a -> String) -> a -> String
+showExplored show x = unsafePerformIO $ fmap (maybe "..." show) $ tryIf isLSCError (evaluate x)
+  where
+    -- Looked at the LSC code to see what sort of errors it was generating...
+    isLSCError (ErrorCall ('\0':msg)) = True
+    isLSCError _                      = False
+    
+    tryIf :: Exception e => (e -> Bool) -> IO a -> IO (Maybe a)
+    tryIf p act = fmap (either (\() -> Nothing) Just) $ tryJust (\e -> guard (p e) >> return ()) act
+
 
 newtype Nat = Nat { unNat :: Int }
             deriving (Eq, Ord)
@@ -88,8 +101,7 @@ dequeue (Queue (x:xs) [])     = Just (rev xs x [])
 data Stream a = a :< Stream a
 
 instance Show a => Show (Stream a) where
-    show xs | not (unsafeIsEvaluated xs) = "..."
-    show (x :< xs) = show x ++ " :< " ++ show xs
+    show = showExplored $ \(x :< xs) -> show x ++ " :< " ++ show xs
 
 instance Serial a => Serial (Stream a) where
     series = cons2 (:<)
@@ -164,7 +176,7 @@ schedulerStreemed (SS sss) = Scheduler (schedule sss)
         (x, xs') = genericDeleteAt xs n
 
 instance Show Scheduler where
-    show _ = "Scheduler" -- FIXME: have to be able to show failing schedulings
+    show _ = "Scheduler" -- FIXME: have to be able to show failing schedulings in a nice way
 
 instance Serial Scheduler where
     series = cons schedulerStreemed >< series
@@ -277,7 +289,7 @@ testScheduleSafe :: Eq r => (forall s. RTSM s r r) -> IO ()
 -- Cuter:
 --testScheduleSafe act = test $ \sched -> expected == runRTSM sched act
 -- More flexible:
-testScheduleSafe act = test $ \ss -> (\res -> trace (res `seq` show ss) res) $ expected == runRTSM (schedulerStreemed ss) act
+testScheduleSafe act = test $ \ss -> trace (show ss) $ expected == runRTSM (schedulerStreemed ss) act
   where expected = runRTSM unfair act
 
 
