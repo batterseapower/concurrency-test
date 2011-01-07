@@ -44,11 +44,11 @@ instance Serial a => Serial (Streem a) where
     series = cons2 Streem
 
 
-prop_fun :: (Bool -> Bool) -> Bool
-prop_fun f = f True == True && f False == False
+-- prop_fun :: (Bool -> Bool) -> Bool
+-- prop_fun f = f True == True && f False == False
 
 
 main :: IO ()
 main = do
-    --test prop_stream
-    test prop_fun
+    test prop_stream
+    --test prop_fun
