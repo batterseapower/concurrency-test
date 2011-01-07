@@ -5,7 +5,11 @@ import Control.Monad
 import Control.Monad.ST
 import Data.STRef
 
-
+-- | A pending coroutine
+--
+-- You almost always want to use (scheduleM (k : pendings)) rather than (unPending k pendings) because
+-- scheduleM gives QuickCheck a chance to try other schedulings, wherease using unPending forces control
+-- flow to continue in the current thread.
 newtype Pending s r = Pending { unPending :: [Pending s r] -> ST s r }
 newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Pending s r }
 
@@ -20,6 +24,12 @@ instance Monad (RTSM s r) where
     return x = RTSM $ \k -> k x
     mx >>= fxmy = RTSM $ \k_y -> Pending $ \pendings -> unPending (unRTSM mx (\x -> unRTSM (fxmy x) k_y)) pendings
 
+-- | Give up control to the scheduler: yields should be used at every point where it is useful to allow QuickCheck
+-- to try several different scheduling options.
+--
+-- It is certainly enough to yield on every bind operation. But this is too much (and it breaks the monad laws).
+-- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
+-- operation and get the same results.
 yield :: RTSM s r ()
 yield = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : pendings)
 
@@ -32,14 +42,14 @@ schedule xs = (last xs, init xs) -- Round robin scheduling (poor mans queue). TO
 
 
 fork :: RTSM s r () -> RTSM s r ()
-fork forkable = RTSM $ \k -> Pending $ \pendings -> unPending (k ()) (unRTSM forkable (\() -> Pending scheduleM) : pendings)
+fork forkable = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : unRTSM forkable (\() -> Pending scheduleM) : pendings)
 
 
 data RTSVarState s r a = RTSVarState {
     rtsvar_data :: Maybe a,
     -- MVars have guaranteed FIFO semantics, so that's what we do here
-    rtsvar_putters :: Queue (Pending s r),
-    rtsvar_takers :: Queue (Pending s r)
+    rtsvar_putters :: Queue (a, Pending s r),
+    rtsvar_takers :: Queue (a -> Pending s r)
   }
 
 newtype RTSVar s r a = RTSVar { unRTSVar :: STRef s (RTSVarState s r a) } -- TODO: I could detect more unreachable states if I find that a RTSVar currently blocking a Pending gets GCed
@@ -51,29 +61,29 @@ newRTSVar :: a -> RTSM s r (RTSVar s r a)
 newRTSVar = newRTSVarInternal . Just
 
 newRTSVarInternal :: Maybe a -> RTSM s r (RTSVar s r a)
-newRTSVarInternal mb_x = RTSM $ \k -> Pending $ \pendings -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings
+newRTSVarInternal mb_x = RTSM $ \k -> Pending $ \pendings -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
 
 takeRTSVar :: RTSVar s r a -> RTSM s r a
-takeRTSVar rtsvar = RTSM try_again
-  where
-    try_again k = Pending $ \pendings -> do
-        state <- readSTRef (unRTSVar rtsvar)
-        case rtsvar_data state of
-           -- TODO: we must guarantee that the woken thread doing a putRTSVar (if any) completes its operation since takeMVar has this guarantee
-          Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = Nothing, rtsvar_putters = putters' }) >> unPending (k x) (maybe id (:) mb_wake_putter pendings)
-            where (mb_wake_putter, putters') = dequeue1 (rtsvar_putters state)
-          Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue (try_again k) (rtsvar_takers state) }) >> scheduleM pendings
+takeRTSVar rtsvar = RTSM $ \k -> Pending $ \pendings -> do
+    state <- readSTRef (unRTSVar rtsvar)
+    case rtsvar_data state of
+       -- NB: we must guarantee that the woken thread doing a putRTSVar (if any) completes its operation since takeMVar has this guarantee
+      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_putters = putters' }) >> scheduleM (k x : pendings')
+        where (dat', putters', pendings') = case dequeue (rtsvar_putters state) of
+                  Nothing                      -> (Nothing, emptyQueue, pendings)
+                  Just ((x, putter), putters') -> (Just x, putters', putter : pendings)
+      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue k (rtsvar_takers state) }) >> scheduleM pendings
 
 putRTSVar :: RTSVar s r a -> a -> RTSM s r ()
-putRTSVar rtsvar x = RTSM try_again
-  where
-    try_again k = Pending $ \pendings -> do
-        state <- readSTRef (unRTSVar rtsvar)
-        case rtsvar_data state of
-           -- TODO: we must guarantee that the woken thread doing a takeRTSVar (if any) completes its operation since putMVar has this guarantee
-          Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = Just x, rtsvar_takers = takers' }) >> unPending (k ()) (maybe id (:) mb_wake_taker pendings)
-            where (mb_wake_taker, takers') = dequeue1 (rtsvar_takers state)
-          Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (try_again k) (rtsvar_putters state) } ) >> scheduleM pendings
+putRTSVar rtsvar x = RTSM $ \k -> Pending $ \pendings -> do
+    state <- readSTRef (unRTSVar rtsvar)
+    case rtsvar_data state of
+       -- NB: we must guarantee that the woken thread doing a takeRTSVar (if any) completes its operation since putMVar has this guarantee
+      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_takers = takers' }) >> scheduleM (k () : pendings')
+        where (dat', takers', pendings') = case dequeue (rtsvar_takers state) of
+                  Nothing                     -> (Just x, emptyQueue, pendings)
+                  Just (mk_pending, putters') -> (Nothing, putters', mk_pending x : pendings)
+      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (x, k ()) (rtsvar_putters state) } ) >> scheduleM pendings
 
 
 data Queue a = Queue [a] [a]
@@ -91,9 +101,6 @@ dequeue (Queue (x:xs) [])     = Just (rev xs x [])
   where
     rev []     x acc = (x, Queue [] acc)
     rev (y:ys) x acc = rev ys y (x:acc)
-
-dequeue1 :: Queue a -> (Maybe a, Queue a)
-dequeue1 = maybe (Nothing, emptyQueue) (\(x, xs) -> (Just x, xs)) . dequeue
 
 
 example1 = do
