@@ -234,11 +234,11 @@ instance Traversable Result where
 -- You almost always want to use (scheduleM (k : pendings)) rather than (unPending k pendings) because
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
-newtype Pending s r = Pending { unPending :: [Pending s r] -> Scheduler -> ST s (Result r) }
-newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Pending s r }
+newtype Pending s r = Pending { unPending :: [Pending s r] -> Nat -> Scheduler -> ST s (Result r) }
+newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Nat -> Pending s r }
 
 runRTSM :: Scheduler -> (forall s. RTSM s r r) -> Result r
-runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _scheduler -> return (Success x))) [] scheduler)
+runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _next_tid _scheduler -> return (Success x)) 0) [] 1 scheduler)
 
 
 instance Functor (RTSM s r) where
@@ -249,8 +249,8 @@ instance Applicative (RTSM s r) where
    (<*>) = ap
 
 instance Monad (RTSM s r) where
-    return x = RTSM $ \k -> k x
-    mx >>= fxmy = RTSM $ \k_y -> unRTSM mx (\x -> unRTSM (fxmy x) k_y)
+    return x = RTSM $ \k _tid -> k x
+    mx >>= fxmy = RTSM $ \k_y tid -> unRTSM mx (\x -> unRTSM (fxmy x) k_y tid) tid
 
 instance MC.MonadConcurrent (RTSM s r) where
     type MC.ThreadId (RTSM s r) = ThreadId
@@ -268,12 +268,12 @@ instance MC.MonadConcurrent (RTSM s r) where
 -- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
 -- operation and get the same results.
 yield :: RTSM s r ()
-yield = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : pendings)
+yield = RTSM $ \k _tid -> Pending $ \pendings -> scheduleM (k () : pendings)
 
-scheduleM :: [Pending s r] -> Scheduler -> ST s (Result r)
-scheduleM pendings scheduler = case pendings of
+scheduleM :: [Pending s r] -> Nat -> Scheduler -> ST s (Result r)
+scheduleM pendings next_tid scheduler = case pendings of
     [] -> return BlockedIndefinitely
-    _  -> unPending k pendings' scheduler'
+    _  -> unPending k pendings' next_tid scheduler'
       where (scheduler', i) = schedule scheduler (genericLength pendings - 1)
             (k, pendings') = genericDeleteAt pendings i
 
@@ -282,10 +282,10 @@ newtype ThreadId = ThreadId Nat
                  deriving (Eq, Ord, Show, Typeable)
 
 forkIO :: RTSM s r () -> RTSM s r (MC.ThreadId (RTSM s r))
-forkIO forkable = RTSM $ \k -> Pending $ \pendings -> scheduleM (k undefined : unRTSM forkable (\() -> Pending scheduleM) : pendings)
+forkIO forkable = RTSM $ \k tid -> Pending $ \pendings next_tid -> scheduleM (k (ThreadId next_tid) : unRTSM forkable (\() -> Pending scheduleM) next_tid : pendings) (next_tid + 1)
 
 myThreadId :: RTSM s r (MC.ThreadId (RTSM s r))
-myThreadId = RTSM $ \k -> Pending $ \pendings -> undefined
+myThreadId = RTSM $ \k tid -> k (ThreadId tid)
 
 
 data RTSVarState s r a = RTSVarState {
@@ -304,29 +304,29 @@ newRTSVar :: a -> RTSM s r (RTSVar s r a)
 newRTSVar = newRTSVarInternal . Just
 
 newRTSVarInternal :: Maybe a -> RTSM s r (RTSVar s r a)
-newRTSVarInternal mb_x = RTSM $ \k -> Pending $ \pendings scheduler -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings scheduler -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
+newRTSVarInternal mb_x = RTSM $ \k _tid -> Pending $ \pendings next_tid scheduler -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings next_tid scheduler -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
 
 takeRTSVar :: RTSVar s r a -> RTSM s r a
-takeRTSVar rtsvar = RTSM $ \k -> Pending $ \pendings scheduler -> do
+takeRTSVar rtsvar = RTSM $ \k _tid -> Pending $ \pendings next_tid scheduler -> do
     state <- readSTRef (unRTSVar rtsvar)
     case rtsvar_data state of
        -- NB: we must guarantee that the woken thread doing a putRTSVar (if any) completes its operation since takeMVar has this guarantee
-      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_putters = putters' }) >> scheduleM (k x : pendings') scheduler
+      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_putters = putters' }) >> scheduleM (k x : pendings') next_tid scheduler
         where (dat', putters', pendings') = case dequeue (rtsvar_putters state) of
                   Nothing                      -> (Nothing, emptyQueue, pendings)
                   Just ((x, putter), putters') -> (Just x, putters', putter : pendings)
-      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue k (rtsvar_takers state) }) >> scheduleM pendings scheduler
+      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue k (rtsvar_takers state) }) >> scheduleM pendings next_tid scheduler
 
 putRTSVar :: RTSVar s r a -> a -> RTSM s r ()
-putRTSVar rtsvar x = RTSM $ \k -> Pending $ \pendings scheduler -> do
+putRTSVar rtsvar x = RTSM $ \k _tid -> Pending $ \pendings next_tid scheduler -> do
     state <- readSTRef (unRTSVar rtsvar)
     case rtsvar_data state of
        -- NB: we must guarantee that the woken thread doing a takeRTSVar (if any) completes its operation since putMVar has this guarantee
-      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_takers = takers' }) >> scheduleM (k () : pendings') scheduler
+      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_takers = takers' }) >> scheduleM (k () : pendings') next_tid scheduler
         where (dat', takers', pendings') = case dequeue (rtsvar_takers state) of
                   Nothing                     -> (Just x, emptyQueue, pendings)
                   Just (mk_pending, putters') -> (Nothing, putters', mk_pending x : pendings)
-      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (x, k ()) (rtsvar_putters state) } ) >> scheduleM pendings scheduler
+      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (x, k ()) (rtsvar_putters state) } ) >> scheduleM pendings next_tid scheduler
 
 
 example1 = do
