@@ -1,20 +1,162 @@
-{-# LANGUAGE Rank2Types #-}
+{-# LANGUAGE Rank2Types, GeneralizedNewtypeDeriving #-}
+
+import Control.Arrow ((***), first, second)
 
 import Control.Monad
 
 import Control.Monad.ST
 import Data.STRef
+import Data.List
+
+import Test.LazySmallCheck
+
+--import Evaluated
+evaluated _ = True -- FIXME: RtClosureInspect not exported :(
+
+
+newtype Nat = Nat { unNat :: Int }
+            deriving (Eq, Ord)
+
+instance Show Nat where
+    show = show . unNat
+
+instance Serial Nat where
+    series d = drawnFrom $ map Nat [0..d]
+
+instance Num Nat where
+    x + y = Nat (unNat x + unNat y)
+    x * y = Nat (unNat x * unNat y)
+    x - y | z < 0     = error $ "Subtracting the naturals " ++ show x ++ " and " ++ show y ++ " produced a negative answer"
+          | otherwise = Nat z
+      where z = unNat x - unNat y
+    negate (Nat 0) = Nat 0
+    negate x = error $ "Cannot negate the strictly-positive natural number " ++ show x
+    abs x = x
+    signum (Nat 0) = Nat 0
+    signum (Nat x) = Nat 1
+    fromInteger x | x < 0     = error $ "The integer " ++ show x ++ " was not a natural number"
+                  | otherwise = Nat (fromInteger x)
+
+instance Real Nat where
+    toRational = toRational . unNat
+
+instance Enum Nat where
+    succ x = Nat (succ (unNat x))
+    pred (Nat 0) = error "Cannot take the predecessor of the natural number 0"
+    pred x       = Nat (pred (unNat x))
+    toEnum x | x < 0     = error $ "Invalid argument to toEnum: " ++ show x
+             | otherwise = Nat x
+    fromEnum = unNat
+
+instance Integral Nat where
+    x `quot` y = Nat (unNat x `quot` unNat y)
+    x `rem` y = Nat (unNat x `rem` unNat y)
+    x `div` y = Nat (unNat x `div` unNat y)
+    x `mod` y = Nat (unNat x `mod` unNat y)
+    x `quotRem` y = (Nat *** Nat) (unNat x `quotRem` unNat y)
+    x `divMod` y = (Nat *** Nat) (unNat x `divMod` unNat y)
+    toInteger = toInteger . unNat
+
+
+data Queue a = Queue [a] [a]
+
+emptyQueue :: Queue a
+emptyQueue = Queue [] []
+
+queue :: a -> Queue a -> Queue a
+queue x (Queue xs ys) = Queue (x : xs) ys
+
+dequeue :: Queue a -> Maybe (a, Queue a)
+dequeue (Queue xs     (y:ys)) = Just (y, Queue xs ys)
+dequeue (Queue []     [])     = Nothing
+dequeue (Queue (x:xs) [])     = Just (rev xs x [])
+  where
+    rev []     x acc = (x, Queue [] acc)
+    rev (y:ys) x acc = rev ys y (x:acc)
+
+
+data Stream a = a :< Stream a
+
+instance Show a => Show (Stream a) where
+    show xs | not (evaluated xs) = "..."
+    show (x :< xs) = show x ++ " :< " ++ show xs
+
+instance Serial a => Serial (Stream a) where
+    series = cons2 (:<) . (+1)
+
+genericIndexStream :: Num i => Stream a -> i -> a
+genericIndexStream (x :< xs) n = if n == 0 then x else genericIndexStream xs (n - 1)
+
+
+data Streem a = Streem a (Stream (Streem a))
+
+instance Serial a => Serial (Streem a) where
+    series = cons2 Streem . (+1)
+
+
+-- | A stream suitable for use for guiding the scheduler. The natural number stored in the nth element
+-- of one of the Stream (Streem Nat) we contain is drawn uniformly from the range [0,n].
+--
+-- In one use of the scheduler, all but one element of each Stream will be discarded, since they correspond
+-- to schedulings for executions with more or less pending processes than we actually saw
+newtype SchedulerStreem = SS { unSS :: Stream (Streem Nat) }
+
+instance Serial SchedulerStreem where
+    series = cons SS >< streamSeries
+      where
+        streemSeries :: Nat -> Series (Streem Nat)
+        streemSeries n = (cons Streem >< (\_ -> drawnFrom [0..n]) >< streamSeries) . (+1)
+    
+        streamSeries :: Series (Stream (Streem Nat))
+        streamSeries = streamSeries' 0
+    
+        streamSeries' :: Nat -> Series (Stream (Streem Nat))
+        streamSeries' n = cons (:<) >< streemSeries n >< streamSeries' (n + 1) . (+1)
+
+
+genericDeleteAt :: Num i => [a] -> i -> (a, [a])
+genericDeleteAt []     _ = error $ "genericDeleteAt: index too large for given list, or list null"
+genericDeleteAt (x:xs) n = if n == 0 then (x, xs) else second (x:) (genericDeleteAt xs (n - 1))
+
+
+newtype Scheduler = Scheduler { schedule :: forall s r. [Pending s r] -> (Scheduler, Pending s r, [Pending s r]) }
+
+roundRobin :: Scheduler
+roundRobin = Scheduler schedule
+  where
+    schedule [] = error "Blocked indefinitely!"
+    schedule xs = (roundRobin, last xs, init xs)
+
+streamed :: Stream Nat -> Scheduler
+streamed (i :< is) = Scheduler schedule
+  where
+    schedule [] = error "Blocked indefinitely!"
+    schedule xs = (streamed is, x, xs')
+      where 
+        n = i `mod` genericLength xs -- A bit unsatisfactory because I really want a uniform chance of scheduling the available threads
+        (x, xs') = genericDeleteAt xs n
+
+schedulerStreemed :: SchedulerStreem -> Scheduler
+schedulerStreemed (SS sss) = Scheduler (schedule sss)
+  where
+    schedule sss [] = error "Blocked indefinitely!"
+    schedule sss xs = (schedulerStreemed (SS sss'), x, xs')
+      where
+        Streem n sss' = genericIndexStream sss (genericLength xs - 1 :: Nat)
+        (x, xs') = genericDeleteAt xs n
+
+
 
 -- | A pending coroutine
 --
 -- You almost always want to use (scheduleM (k : pendings)) rather than (unPending k pendings) because
 -- scheduleM gives QuickCheck a chance to try other schedulings, wherease using unPending forces control
 -- flow to continue in the current thread.
-newtype Pending s r = Pending { unPending :: [Pending s r] -> ST s r }
+newtype Pending s r = Pending { unPending :: [Pending s r] -> Scheduler -> ST s r }
 newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Pending s r }
 
-runRTSM :: (forall s. RTSM s r r) -> r
-runRTSM mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings -> return x)) [])
+runRTSM :: Scheduler -> (forall s. RTSM s r r) -> r
+runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _scheduler -> return x)) [] scheduler)
 
 
 instance Functor (RTSM s r) where
@@ -22,7 +164,7 @@ instance Functor (RTSM s r) where
 
 instance Monad (RTSM s r) where
     return x = RTSM $ \k -> k x
-    mx >>= fxmy = RTSM $ \k_y -> Pending $ \pendings -> unPending (unRTSM mx (\x -> unRTSM (fxmy x) k_y)) pendings
+    mx >>= fxmy = RTSM $ \k_y -> unRTSM mx (\x -> unRTSM (fxmy x) k_y)
 
 -- | Give up control to the scheduler: yields should be used at every point where it is useful to allow QuickCheck
 -- to try several different scheduling options.
@@ -33,12 +175,8 @@ instance Monad (RTSM s r) where
 yield :: RTSM s r ()
 yield = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : pendings)
 
-scheduleM :: [Pending s r] -> ST s r
-scheduleM pendings = case schedule pendings of (pending, pendings) -> unPending pending pendings
-
-schedule :: [Pending s r] -> (Pending s r, [Pending s r])
-schedule [] = error "Blocked indefinitely!"
-schedule xs = (last xs, init xs) -- Round robin scheduling (poor mans queue). TODO: other scheduling strategies
+scheduleM :: [Pending s r] -> Scheduler -> ST s r
+scheduleM pendings scheduler = case schedule scheduler pendings of (scheduler, pending, pendings) -> unPending pending pendings scheduler
 
 
 fork :: RTSM s r () -> RTSM s r ()
@@ -61,46 +199,29 @@ newRTSVar :: a -> RTSM s r (RTSVar s r a)
 newRTSVar = newRTSVarInternal . Just
 
 newRTSVarInternal :: Maybe a -> RTSM s r (RTSVar s r a)
-newRTSVarInternal mb_x = RTSM $ \k -> Pending $ \pendings -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
+newRTSVarInternal mb_x = RTSM $ \k -> Pending $ \pendings scheduler -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings scheduler -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
 
 takeRTSVar :: RTSVar s r a -> RTSM s r a
-takeRTSVar rtsvar = RTSM $ \k -> Pending $ \pendings -> do
+takeRTSVar rtsvar = RTSM $ \k -> Pending $ \pendings scheduler -> do
     state <- readSTRef (unRTSVar rtsvar)
     case rtsvar_data state of
        -- NB: we must guarantee that the woken thread doing a putRTSVar (if any) completes its operation since takeMVar has this guarantee
-      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_putters = putters' }) >> scheduleM (k x : pendings')
+      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_putters = putters' }) >> scheduleM (k x : pendings') scheduler
         where (dat', putters', pendings') = case dequeue (rtsvar_putters state) of
                   Nothing                      -> (Nothing, emptyQueue, pendings)
                   Just ((x, putter), putters') -> (Just x, putters', putter : pendings)
-      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue k (rtsvar_takers state) }) >> scheduleM pendings
+      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue k (rtsvar_takers state) }) >> scheduleM pendings scheduler
 
 putRTSVar :: RTSVar s r a -> a -> RTSM s r ()
-putRTSVar rtsvar x = RTSM $ \k -> Pending $ \pendings -> do
+putRTSVar rtsvar x = RTSM $ \k -> Pending $ \pendings scheduler -> do
     state <- readSTRef (unRTSVar rtsvar)
     case rtsvar_data state of
        -- NB: we must guarantee that the woken thread doing a takeRTSVar (if any) completes its operation since putMVar has this guarantee
-      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_takers = takers' }) >> scheduleM (k () : pendings')
+      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_takers = takers' }) >> scheduleM (k () : pendings') scheduler
         where (dat', takers', pendings') = case dequeue (rtsvar_takers state) of
                   Nothing                     -> (Just x, emptyQueue, pendings)
                   Just (mk_pending, putters') -> (Nothing, putters', mk_pending x : pendings)
-      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (x, k ()) (rtsvar_putters state) } ) >> scheduleM pendings
-
-
-data Queue a = Queue [a] [a]
-
-emptyQueue :: Queue a
-emptyQueue = Queue [] []
-
-queue :: a -> Queue a -> Queue a
-queue x (Queue xs ys) = Queue (x : xs) ys
-
-dequeue :: Queue a -> Maybe (a, Queue a)
-dequeue (Queue xs     (y:ys)) = Just (y, Queue xs ys)
-dequeue (Queue []     [])     = Nothing
-dequeue (Queue (x:xs) [])     = Just (rev xs x [])
-  where
-    rev []     x acc = (x, Queue [] acc)
-    rev (y:ys) x acc = rev ys y (x:acc)
+      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (x, k ()) (rtsvar_putters state) } ) >> scheduleM pendings scheduler
 
 
 example1 = do
@@ -122,4 +243,4 @@ example2 = do
     takeRTSVar v_out
 
 main :: IO ()
-main = print $ runRTSM example2
+main = print $ runRTSM roundRobin example2
