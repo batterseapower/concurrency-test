@@ -9,14 +9,22 @@ import Data.STRef
 import Data.List
 
 import Test.LazySmallCheck
+import Test.QuickCheck hiding ((><))
+import Test.QuickCheck.Gen
 
-import Data.TagBits
+import System.Random
+
+import Prelude hiding (catch)
+
 
 import Debug.Trace
 
 import System.IO.Unsafe
 
-import Prelude hiding (catch)
+
+instance Arbitrary StdGen where
+    arbitrary = MkGen $ \gen _ -> gen
+    shrink _ = []
 
 
 {-# NOINLINE exceptionTrace #-}
@@ -25,9 +33,9 @@ exceptionTrace x = unsafePerformIO (evaluate x `catch` (\e -> trace ("Exception 
 
 -- I used to use unsafeIsEvaluated to decide where to put in "...", but that pruned too heavily because
 -- I couldn't show the schedule before it was actually poked on and those thunks turned into real values.
-{-# NOINLINE showExplored #-}
-showExplored :: (a -> String) -> a -> String
-showExplored show x = unsafePerformIO $ fmap (maybe "..." show) $ tryIf isLSCError (evaluate x)
+{-# NOINLINE showsExplored #-}
+showsExplored :: (a -> ShowS) -> a -> ShowS
+showsExplored shows x = unsafePerformIO $ fmap (maybe (showString "...") shows) $ tryIf isLSCError (evaluate x)
   where
     -- Looked at the LSC code to see what sort of errors it was generating...
     isLSCError (ErrorCall ('\0':msg)) = True
@@ -101,7 +109,7 @@ dequeue (Queue (x:xs) [])     = Just (rev xs x [])
 data Stream a = a :< Stream a
 
 instance Show a => Show (Stream a) where
-    show = showExplored $ \(x :< xs) -> show x ++ " :< " ++ show xs
+    showsPrec d = showsExplored (\(x :< xs) -> showParen (d > 0) $ showsPrec 1 x . showString " :< " . showsPrec 1 xs)
 
 instance Serial a => Serial (Stream a) where
     series = cons2 (:<)
@@ -126,7 +134,7 @@ newtype SchedulerStreem = SS { unSS :: Stream (Streem Nat) }
                         deriving (Show)
 
 instance Serial SchedulerStreem where
-    series = cons SS >< streamSeries
+    series = cons SS >< streamSeries . (+1)
       where
         streemSeries :: Nat -> Series (Streem Nat)
         streemSeries n = (cons Streem >< (\_ -> drawnFrom [0..n]) >< streamSeries) . (+1)
@@ -167,12 +175,21 @@ streamed (i :< is) = Scheduler schedule
         (x, xs') = genericDeleteAt xs n
 
 schedulerStreemed :: SchedulerStreem -> Scheduler
-schedulerStreemed (SS sss) = Scheduler (schedule sss)
+schedulerStreemed (SS sss) = Scheduler schedule
   where
-    schedule sss [] = error "Blocked indefinitely!"
-    schedule sss xs = (schedulerStreemed (SS sss'), x, xs')
+    schedule [] = error "Blocked indefinitely!"
+    schedule xs = (schedulerStreemed (SS sss'), x, xs')
       where
         Streem n sss' = genericIndexStream sss (genericLength xs - 1 :: Nat)
+        (x, xs') = genericDeleteAt xs n
+
+randomised :: StdGen -> Scheduler
+randomised gen = Scheduler schedule
+  where
+    schedule [] = error "Blocked indefinitely!"
+    schedule xs = (randomised gen', x, xs')
+      where
+        (n, gen') = randomR (0, length xs - 1) gen
         (x, xs') = genericDeleteAt xs n
 
 instance Show Scheduler where
@@ -290,7 +307,9 @@ testScheduleSafe :: Eq r => (forall s. RTSM s r r) -> IO ()
 --testScheduleSafe act = test $ \sched -> expected == runRTSM sched act
 -- More flexible:
 testScheduleSafe act = test $ \ss -> trace (show ss) $ expected == runRTSM (schedulerStreemed ss) act
-  where expected = runRTSM unfair act
+-- Working:
+--testScheduleSafe act = quickCheck $ \gen -> expected == runRTSM (randomised gen) act
+  where expected = runRTSM roundRobin act
 
 
 main :: IO ()
