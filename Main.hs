@@ -1,9 +1,9 @@
 {-# LANGUAGE Rank2Types, GeneralizedNewtypeDeriving #-}
 
 import Control.Arrow ((***), first, second)
+import Control.Exception
 
 import Control.Monad
-
 import Control.Monad.ST
 import Data.STRef
 import Data.List
@@ -11,6 +11,17 @@ import Data.List
 import Test.LazySmallCheck
 
 import Data.TagBits
+
+import Debug.Trace
+
+import System.IO.Unsafe
+
+import Prelude hiding (catch)
+
+
+{-# NOINLINE exceptionTrace #-}
+exceptionTrace :: a -> a
+exceptionTrace x = unsafePerformIO (evaluate x `catch` (\e -> trace ("Exception in pure code: " ++ show (e :: SomeException)) $ throw e))
 
 
 newtype Nat = Nat { unNat :: Int }
@@ -263,7 +274,10 @@ example3 = do
 
 
 testScheduleSafe :: Eq r => (forall s. RTSM s r r) -> IO ()
-testScheduleSafe act = test $ \sched -> expected == runRTSM sched act
+-- Cuter:
+--testScheduleSafe act = test $ \sched -> expected == runRTSM sched act
+-- More flexible:
+testScheduleSafe act = test $ \ss -> (\res -> trace (res `seq` show ss) res) $ expected == runRTSM (schedulerStreemed ss) act
   where expected = runRTSM unfair act
 
 
