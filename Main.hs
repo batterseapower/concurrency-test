@@ -96,6 +96,10 @@ instance Integral Nat where
     x `divMod` y = (Nat *** Nat) (unNat x `divMod` unNat y)
     toInteger = toInteger . unNat
 
+instance Random Nat where
+    randomR (lo, hi) g = first Nat $ randomR (unNat lo, unNat hi) g
+    random g = first (Nat . abs) $ random g
+
 
 data Queue a = Queue [a] [a]
 
@@ -159,49 +163,38 @@ genericDeleteAt []     _ = error $ "genericDeleteAt: index too large for given l
 genericDeleteAt (x:xs) n = if n == 0 then (x, xs) else second (x:) (genericDeleteAt xs (n - 1))
 
 
-newtype Scheduler = Scheduler { schedule :: forall s r. [Pending s r] -> Result (Scheduler, Pending s r, [Pending s r]) }
+newtype Scheduler = Scheduler { schedule :: forall s r.    Nat              -- ^ One less than the number of pending processes (n)
+                                                        -> (Scheduler, Nat) -- ^ Pending process to run, and the next scheduler (0-based index, so valid values are from 0 to n inclusive)
+                              }
 
 unfair :: Scheduler
 unfair = Scheduler schedule
-  where
-    schedule []     = BlockedIndefinitely
-    schedule (x:xs) = Success (unfair, x, xs)
+  where schedule _ = (unfair, 0)
 
 roundRobin :: Scheduler
 roundRobin = Scheduler schedule
-  where
-    schedule [] = BlockedIndefinitely
-    schedule xs = Success (roundRobin, last xs, init xs)
+  where schedule n = (roundRobin, n)
 
 streamed :: Stream Nat -> Scheduler
 streamed (i :< is) = Scheduler schedule
-  where
-    schedule [] = BlockedIndefinitely
-    schedule xs = Success (streamed is, x, xs')
-      where 
-        n = i `mod` genericLength xs -- A bit unsatisfactory because I really want a uniform chance of scheduling the available threads
-        (x, xs') = genericDeleteAt xs n
+  where schedule n = (streamed is, i `mod` n) -- A bit unsatisfactory because I really want a uniform chance of scheduling the available threads
 
 schedulerStreemed :: SchedulerStreem -> Scheduler
 schedulerStreemed (SS sss) = Scheduler schedule
-  where
-    schedule [] = BlockedIndefinitely
-    schedule xs = Success (schedulerStreemed (SS sss'), x, xs')
-      where
-        Streem n sss' = genericIndexStream sss (genericLength xs - 1 :: Nat)
-        (x, xs') = genericDeleteAt xs n
+  where schedule n = (schedulerStreemed (SS sss'), i)
+          where Streem i sss' = genericIndexStream sss n
 
 randomised :: StdGen -> Scheduler
 randomised gen = Scheduler schedule
-  where
-    schedule [] = BlockedIndefinitely
-    schedule xs = Success (randomised gen', x, xs')
-      where
-        (n, gen') = randomR (0, length xs - 1) gen
-        (x, xs') = genericDeleteAt xs n
+  where schedule n = (randomised gen', i)
+          where (i, gen') = randomR (0, n) gen
 
 instance Show Scheduler where
     show _ = "Scheduler" -- FIXME: have to be able to show failing schedulings in a nice way
+
+instance Arbitrary Scheduler where
+    arbitrary = fmap randomised arbitrary
+    shrink _ = []
 
 instance Serial Scheduler where
     series = cons schedulerStreemed >< series
@@ -265,7 +258,11 @@ yield :: RTSM s r ()
 yield = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : pendings)
 
 scheduleM :: [Pending s r] -> Scheduler -> ST s (Result r)
-scheduleM pendings scheduler = fmap join $ traverse (\(scheduler, pending, pendings) -> unPending pending pendings scheduler) (schedule scheduler pendings)
+scheduleM pendings scheduler = case pendings of
+    [] -> return BlockedIndefinitely
+    _  -> unPending k pendings' scheduler'
+      where (scheduler', i) = schedule scheduler (genericLength pendings - 1)
+            (k, pendings') = genericDeleteAt pendings i
 
 
 fork :: RTSM s r () -> RTSM s r ()
