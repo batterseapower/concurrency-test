@@ -152,6 +152,11 @@ schedulerStreemed (SS sss) = Scheduler (schedule sss)
         Streem n sss' = genericIndexStream sss (genericLength xs - 1 :: Nat)
         (x, xs') = genericDeleteAt xs n
 
+instance Show Scheduler where
+    show _ = "Scheduler" -- FIXME: have to be able to show failing schedulings
+
+instance Serial Scheduler where
+    series = cons schedulerStreemed >< series
 
 
 -- | A pending coroutine
@@ -258,7 +263,7 @@ example3 = do
 
 
 testScheduleSafe :: Eq r => (forall s. RTSM s r r) -> IO ()
-testScheduleSafe act = test $ \ss -> expected == runRTSM (schedulerStreemed ss) act
+testScheduleSafe act = test $ \sched -> expected == runRTSM sched act
   where expected = runRTSM unfair act
 
 
