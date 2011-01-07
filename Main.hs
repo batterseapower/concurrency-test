@@ -159,52 +159,48 @@ genericDeleteAt []     _ = error $ "genericDeleteAt: index too large for given l
 genericDeleteAt (x:xs) n = if n == 0 then (x, xs) else second (x:) (genericDeleteAt xs (n - 1))
 
 
-newtype Scheduler = Scheduler { schedule :: forall s r. [Pending s r] -> Result (Scheduler, Pending s r, [Pending s r]) }
+class Scheduler h where
+    schedule :: h -> [Pending h s r] -> Result (h, Pending h s r, [Pending h s r])
 
-unfair :: Scheduler
-unfair = Scheduler schedule
-  where
-    schedule []     = BlockedIndefinitely
-    schedule (x:xs) = Success (unfair, x, xs)
+data Unfair = Unfair
+instance Scheduler Unfair where
+    schedule Unfair []     = BlockedIndefinitely
+    schedule Unfair (x:xs) = Success (Unfair, x, xs)
 
-roundRobin :: Scheduler
-roundRobin = Scheduler schedule
-  where
-    schedule [] = BlockedIndefinitely
-    schedule xs = Success (roundRobin, last xs, init xs)
+data RoundRobin = RoundRobin
+instance Scheduler RoundRobin where
+    schedule RoundRobin [] = BlockedIndefinitely
+    schedule RoundRobin xs = Success (RoundRobin, last xs, init xs)
 
-streamed :: Stream Nat -> Scheduler
-streamed (i :< is) = Scheduler schedule
-  where
-    schedule [] = BlockedIndefinitely
-    schedule xs = Success (streamed is, x, xs')
+data Streamed = Streamed (Stream Nat)
+instance Scheduler Streamed where
+    schedule (Streamed _)         [] = BlockedIndefinitely
+    schedule (Streamed (i :< is)) xs = Success (Streamed is, x, xs')
       where 
         n = i `mod` genericLength xs -- A bit unsatisfactory because I really want a uniform chance of scheduling the available threads
         (x, xs') = genericDeleteAt xs n
 
-schedulerStreemed :: SchedulerStreem -> Scheduler
-schedulerStreemed (SS sss) = Scheduler schedule
-  where
-    schedule [] = BlockedIndefinitely
-    schedule xs = Success (schedulerStreemed (SS sss'), x, xs')
+data SchedulerStreemed = SchedulerStreemed SchedulerStreem
+instance Scheduler SchedulerStreemed where
+    schedule (SchedulerStreemed _)        [] = BlockedIndefinitely
+    schedule (SchedulerStreemed (SS sss)) xs = Success (SchedulerStreemed (SS sss'), x, xs')
       where
         Streem n sss' = genericIndexStream sss (genericLength xs - 1 :: Nat)
         (x, xs') = genericDeleteAt xs n
 
-randomised :: StdGen -> Scheduler
-randomised gen = Scheduler schedule
-  where
-    schedule [] = BlockedIndefinitely
-    schedule xs = Success (randomised gen', x, xs')
+instance Show SchedulerStreemed where
+    show _ = "SchedulerStreemed" -- FIXME: have to be able to show failing schedulings in a nice way
+
+instance Serial SchedulerStreemed where
+    series = cons SchedulerStreemed >< series
+
+data Randomised = Randomised StdGen
+instance Scheduler Randomised where
+    schedule (Randomised gen) [] = BlockedIndefinitely
+    schedule (Randomised gen) xs = Success (Randomised gen', x, xs')
       where
         (n, gen') = randomR (0, length xs - 1) gen
         (x, xs') = genericDeleteAt xs n
-
-instance Show Scheduler where
-    show _ = "Scheduler" -- FIXME: have to be able to show failing schedulings in a nice way
-
-instance Serial Scheduler where
-    series = cons schedulerStreemed >< series
 
 
 data Result a = Success a
@@ -237,21 +233,21 @@ instance Traversable Result where
 -- You almost always want to use (scheduleM (k : pendings)) rather than (unPending k pendings) because
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
-newtype Pending s r = Pending { unPending :: [Pending s r] -> Scheduler -> ST s (Result r) }
-newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Pending s r }
+newtype Pending h s r = Pending { unPending :: [Pending h s r] -> h -> ST s (Result r) }
+newtype RTSM h s r a = RTSM { unRTSM :: (a -> Pending h s r) -> Pending h s r }
 
-runRTSM :: Scheduler -> (forall s. RTSM s r r) -> Result r
+runRTSM :: h -> (forall s. RTSM h s r r) -> Result r
 runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _scheduler -> return (Success x))) [] scheduler)
 
 
-instance Functor (RTSM s r) where
+instance Functor (RTSM h s r) where
     fmap = liftM
 
-instance Applicative (RTSM s r) where
+instance Applicative (RTSM h s r) where
    pure = return
    (<*>) = ap
 
-instance Monad (RTSM s r) where
+instance Monad (RTSM h s r) where
     return x = RTSM $ \k -> k x
     mx >>= fxmy = RTSM $ \k_y -> unRTSM mx (\x -> unRTSM (fxmy x) k_y)
 
@@ -261,36 +257,36 @@ instance Monad (RTSM s r) where
 -- It is certainly enough to yield on every bind operation. But this is too much (and it breaks the monad laws).
 -- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
 -- operation and get the same results.
-yield :: RTSM s r ()
+yield :: Scheduler h => RTSM h s r ()
 yield = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : pendings)
 
-scheduleM :: [Pending s r] -> Scheduler -> ST s (Result r)
+scheduleM :: Scheduler h => [Pending h s r] -> h -> ST s (Result r)
 scheduleM pendings scheduler = fmap join $ traverse (\(scheduler, pending, pendings) -> unPending pending pendings scheduler) (schedule scheduler pendings)
 
 
-fork :: RTSM s r () -> RTSM s r ()
+fork :: Scheduler h => RTSM h s r () -> RTSM h s r ()
 fork forkable = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : unRTSM forkable (\() -> Pending scheduleM) : pendings)
 
 
-data RTSVarState s r a = RTSVarState {
+data RTSVarState h s r a = RTSVarState {
     rtsvar_data :: Maybe a,
     -- MVars have guaranteed FIFO semantics, so that's what we do here
-    rtsvar_putters :: Queue (a, Pending s r),
-    rtsvar_takers :: Queue (a -> Pending s r)
+    rtsvar_putters :: Queue (a, Pending h s r),
+    rtsvar_takers :: Queue (a -> Pending h s r)
   }
 
-newtype RTSVar s r a = RTSVar { unRTSVar :: STRef s (RTSVarState s r a) } -- TODO: I could detect more unreachable states if I find that a RTSVar currently blocking a Pending gets GCed
+newtype RTSVar h s r a = RTSVar { unRTSVar :: STRef s (RTSVarState h s r a) } -- TODO: I could detect more unreachable states if I find that a RTSVar currently blocking a Pending gets GCed
 
-newEmptyRTSVar :: RTSM s r (RTSVar s r a)
+newEmptyRTSVar :: RTSM h s r (RTSVar h s r a)
 newEmptyRTSVar = newRTSVarInternal Nothing
 
-newRTSVar :: a -> RTSM s r (RTSVar s r a)
+newRTSVar :: a -> RTSM h s r (RTSVar h s r a)
 newRTSVar = newRTSVarInternal . Just
 
-newRTSVarInternal :: Maybe a -> RTSM s r (RTSVar s r a)
+newRTSVarInternal :: Maybe a -> RTSM h s r (RTSVar h s r a)
 newRTSVarInternal mb_x = RTSM $ \k -> Pending $ \pendings scheduler -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings scheduler -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
 
-takeRTSVar :: RTSVar s r a -> RTSM s r a
+takeRTSVar :: Scheduler h => RTSVar h s r a -> RTSM h s r a
 takeRTSVar rtsvar = RTSM $ \k -> Pending $ \pendings scheduler -> do
     state <- readSTRef (unRTSVar rtsvar)
     case rtsvar_data state of
@@ -301,7 +297,7 @@ takeRTSVar rtsvar = RTSM $ \k -> Pending $ \pendings scheduler -> do
                   Just ((x, putter), putters') -> (Just x, putters', putter : pendings)
       Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue k (rtsvar_takers state) }) >> scheduleM pendings scheduler
 
-putRTSVar :: RTSVar s r a -> a -> RTSM s r ()
+putRTSVar :: Scheduler h => RTSVar h s r a -> a -> RTSM h s r ()
 putRTSVar rtsvar x = RTSM $ \k -> Pending $ \pendings scheduler -> do
     state <- readSTRef (unRTSVar rtsvar)
     case rtsvar_data state of
@@ -313,6 +309,7 @@ putRTSVar rtsvar x = RTSM $ \k -> Pending $ \pendings scheduler -> do
       Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (x, k ()) (rtsvar_putters state) } ) >> scheduleM pendings scheduler
 
 
+example1 :: Scheduler h => RTSM h s r Int
 example1 = do
     yield
     v <- newEmptyRTSVar
@@ -322,6 +319,7 @@ example1 = do
     --takeRTSVar v
     takeRTSVar v
 
+example2 :: Scheduler h => RTSM h s r Int
 example2 = do
     v_in <- newRTSVar 1336
     v_out <- newEmptyRTSVar
@@ -332,6 +330,7 @@ example2 = do
     takeRTSVar v_out
 
 -- An example with a race: depending on scheduling, this either returns "Hello" or "World"
+example3 :: Scheduler h => RTSM h s r String
 example3 = do
     v <- newEmptyRTSVar
     fork $ putRTSVar v "Hello"
@@ -339,21 +338,21 @@ example3 = do
     takeRTSVar v
 
 
-testScheduleSafe :: Eq r => (forall s. RTSM s r r) -> IO ()
+testScheduleSafe :: Eq r => (forall h s. Scheduler h => RTSM h s r r) -> IO ()
 -- Cuter:
 --testScheduleSafe act = test $ \sched -> expected == runRTSM sched act
 -- More flexible:
-testScheduleSafe act = test $ \ss -> trace (show ss) $ expected == runRTSM (schedulerStreemed ss) act
+testScheduleSafe act = test $ \ss -> trace (show ss) $ expected == runRTSM (SchedulerStreemed ss) act
 -- Working:
 --testScheduleSafe act = quickCheck $ \gen -> expected == runRTSM (randomised gen) act
-  where expected = runRTSM roundRobin act
+  where expected = runRTSM RoundRobin act
 
 
 main :: IO ()
 main = do
     -- Demonstrates the presence of a data race - these two invocations return different results
-    print $ runRTSM unfair example3
-    print $ runRTSM roundRobin example3
+    print $ runRTSM Unfair example3
+    print $ runRTSM RoundRobin example3
 
     -- Let's see if we can find the race automatically!
     testScheduleSafe example3
