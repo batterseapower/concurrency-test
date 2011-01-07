@@ -95,7 +95,7 @@ empty d = C (SumOfProd []) []
     C (SumOfProd ps) cfs = f d
     C ta cas = a (d-1)
     cs = [\(x:xs) -> cf xs (conv cas x) | shallow, cf <- cfs]
-    shallow = d > 0 && nonEmpty ta
+    shallow = d > 0 -- && nonEmpty ta
 
 nonEmpty :: Type -> Bool
 nonEmpty (SumOfProd ps) = not (null ps)
@@ -233,8 +233,7 @@ refute r = ref (args r)
 
         report =
           do putStrLn "Counter example found:"
-             mapM_ putStrLn $ zipWith ($) (showArgs r)
-                            $ head [ys | ys <- mapM total xs]
+             mapM_ putStrLn $ zipWith ($) (showArgs r) xs
              exitWith ExitSuccess
 
 sumMapM :: (a -> IO Int) -> Int -> [a] -> IO Int
