@@ -81,13 +81,14 @@ instance Show a => Show (Stream a) where
     show (x :< xs) = show x ++ " :< " ++ show xs
 
 instance Serial a => Serial (Stream a) where
-    series = cons2 (:<) . (+1)
+    series = cons2 (:<)
 
 genericIndexStream :: Num i => Stream a -> i -> a
 genericIndexStream (x :< xs) n = if n == 0 then x else genericIndexStream xs (n - 1)
 
 
 data Streem a = Streem a (Stream (Streem a))
+              deriving (Show)
 
 instance Serial a => Serial (Streem a) where
     series = cons2 Streem . (+1)
@@ -99,6 +100,7 @@ instance Serial a => Serial (Streem a) where
 -- In one use of the scheduler, all but one element of each Stream will be discarded, since they correspond
 -- to schedulings for executions with more or less pending processes than we actually saw
 newtype SchedulerStreem = SS { unSS :: Stream (Streem Nat) }
+                        deriving (Show)
 
 instance Serial SchedulerStreem where
     series = cons SS >< streamSeries
@@ -110,7 +112,7 @@ instance Serial SchedulerStreem where
         streamSeries = streamSeries' 0
     
         streamSeries' :: Nat -> Series (Stream (Streem Nat))
-        streamSeries' n = cons (:<) >< streemSeries n >< streamSeries' (n + 1) . (+1)
+        streamSeries' n = cons (:<) >< streemSeries n >< streamSeries' (n + 1)
 
 
 genericDeleteAt :: Num i => [a] -> i -> (a, [a])
@@ -254,8 +256,18 @@ example3 = do
     fork $ putRTSVar v "World"
     takeRTSVar v
 
+
+testScheduleSafe :: Eq r => (forall s. RTSM s r r) -> IO ()
+testScheduleSafe act = test $ \ss -> expected == runRTSM (schedulerStreemed ss) act
+  where expected = runRTSM unfair act
+
+
 main :: IO ()
 main = do
     -- Demonstrates the presence of a data race - these two invocations return different results
     print $ runRTSM unfair example3
     print $ runRTSM roundRobin example3
+
+    -- Let's see if we can find the race automatically!
+    testScheduleSafe example3
+
