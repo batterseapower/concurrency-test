@@ -2,7 +2,7 @@
 -- automatic exhaustive testing for small values" available at
 -- <http://www.cs.york.ac.uk/fp/smallcheck/>.  Several examples are
 -- also included in the package.
-
+{-# LANGUAGE TypeFamilies, ScopedTypeVariables #-}
 module Test.LazySmallCheck
   ( Serial(series) -- :: class
   , Series         -- :: type Series a = Int -> Cons a
@@ -222,23 +222,20 @@ answer a known unknown =
 
 -- Refute
 
-refute :: Result -> IO Int
+refute :: Result a -> IO (Report a)
 refute r = ref (args r)
   where
     ref xs = eval (apply r xs) known unknown
       where
-        known True = return 1
-        known False = report
+        known True = return (Success 1)
+        known False = return (Failure (zipWith ($) (showArgs r) xs) (failInfo r xs))
         unknown p = sumMapM ref 1 (refineList xs p)
 
-        report =
-          do putStrLn "Counter example found:"
-             mapM_ putStrLn $ zipWith ($) (showArgs r) xs
-             exitWith ExitSuccess
-
-sumMapM :: (a -> IO Int) -> Int -> [a] -> IO Int
-sumMapM f n [] = return n
-sumMapM f n (a:as) = seq n (do m <- f a ; sumMapM f (n+m) as)
+sumMapM :: (a -> IO (Report b)) -> Int -> [a] -> IO (Report b)
+sumMapM f n [] = return (Success n)
+sumMapM f n (a:as) = seq n $ do
+    report <- f a
+    continueReport report (\m -> sumMapM f (n+m) as)
 
 -- Properties with parallel conjunction (Lindblad TFP'07)
 
@@ -280,42 +277,79 @@ True ==> x = x
 
 -- Testable
 
-data Result =
+data Result a =
   Result { args     :: [Term]
          , showArgs :: [Term -> String]
+         , failInfo :: [Term] -> FailInfo a
          , apply    :: [Term] -> Property
          }
 
-data P = P (Int -> Int -> Result)
+data P a = P (Int -> Int -> Result a)
 
-run :: Testable a => ([Term] -> a) -> Int -> Int -> Result
+run :: Testable a => ([Term] -> a) -> Int -> Int -> Result a
 run a = f where P f = property a
 
 class Testable a where
-  property :: ([Term] -> a) -> P
+  type FailInfo a
+  property :: ([Term] -> a) -> P a
 
 instance Testable Bool where
-  property apply = P $ \n d -> Result [] [] (Bool . apply . reverse)
+  type FailInfo Bool = ()
+  property apply = P $ \n d -> Result [] [] (\[] -> ()) (Bool . apply . reverse)
 
 instance Testable Property where
-  property apply = P $ \n d -> Result [] [] (apply . reverse)
+  type FailInfo Property = ()
+  property apply = P $ \n d -> Result [] [] (\[] -> ()) (apply . reverse)
 
 instance (Show a, Serial a, Testable b) => Testable (a -> b) where
+  type FailInfo (a -> b) = (a, FailInfo b)
   property f = P $ \n d ->
     let C t c = series d
         c' = conv c
         r = run (\(x:xs) -> f xs (c' x)) (n+1) d
-    in  r { args = Var [n] t : args r, showArgs = (show . c') : showArgs r }
+    in  Result { args = Var [n] t : args r, showArgs = (show . c') : showArgs r, failInfo = \(x:xs) -> (c' x, failInfo r xs), apply = apply r }
+
+data Report a = Success { testsRun :: Int }
+              | Failure { argStrings :: [String], failure :: FailInfo a }
+
+continueReport :: Monad m => Report a -> (Int -> m (Report a)) -> m (Report a)
+continueReport (Success m)   k = k m
+continueReport (Failure s f) _ = return (Failure s f)
+
+putReport :: Report a -> IO ()
+putReport (Success n)      = putStrLn $ "OK, required " ++ show n ++ " tests"
+putReport (Failure args _) = do
+    putStrLn "Counter example found:"
+    mapM_ putStrLn args
+    exitWith ExitSuccess
 
 -- Top-level interface
 
 depthCheck :: Testable a => Int -> a -> IO ()
-depthCheck d p =
-  do n <- refute $ run (const p) 0 d
-     putStrLn $ "OK, required " ++ show n ++ " tests at depth " ++ show d
+depthCheck d p = depthCheck' d p >>= putReport
+
+depthCheck' :: Testable a => Int -> a -> IO (Report a)
+depthCheck' d p = refute (run (const p) 0 d)
 
 smallCheck :: Testable a => Int -> a -> IO ()
-smallCheck d p = mapM_ (`depthCheck` p) [0..d]
+smallCheck d p = smallCheck' d p >>= putReport
 
-test :: Testable a => a -> IO ()
-test p = mapM_ (`depthCheck` p) [0..]
+smallCheck' :: Testable a => Int -> a -> IO (Report a)
+smallCheck' d p = go 0 [0..d]
+  where
+    go n [] = return (Success n)
+    go n (d:ds) = do
+        report <- d `depthCheck'` p
+        continueReport report $ \m -> go (n + m) ds
+
+test :: forall a. Testable a => a -> IO ()
+test p = test' p >>= (putReport :: Report a -> IO ()) . uncurry Failure
+
+test' :: Testable a => a -> IO ([String], FailInfo a)
+test' p = go 0
+  where
+    go d = do
+        report <- depthCheck' d p
+        case report of
+          Success _              -> go (d + 1)
+          Failure args fail_info -> return (args, fail_info)
