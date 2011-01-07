@@ -1,4 +1,4 @@
-{-# LANGUAGE Rank2Types, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE Rank2Types, GeneralizedNewtypeDeriving, TypeFamilies, DeriveDataTypeable #-}
 
 import Control.Arrow ((***), first, second)
 import Control.Applicative (Applicative(..))
@@ -11,6 +11,7 @@ import Data.List
 import Data.Monoid (mempty)
 import Data.Foldable (Foldable(foldMap))
 import Data.Traversable (Traversable(traverse))
+import Data.Typeable (Typeable(..))
 
 import Test.LazySmallCheck
 import Test.QuickCheck hiding (Success, Result, (><))
@@ -251,6 +252,15 @@ instance Monad (RTSM s r) where
     return x = RTSM $ \k -> k x
     mx >>= fxmy = RTSM $ \k_y -> unRTSM mx (\x -> unRTSM (fxmy x) k_y)
 
+instance MC.MonadConcurrent (RTSM s r) where
+    type MC.ThreadId (RTSM s r) = ThreadId
+
+    forkIO = forkIO
+    myThreadId = myThreadId
+
+    yield = yield
+
+
 -- | Give up control to the scheduler: yields should be used at every point where it is useful to allow QuickCheck
 -- to try several different scheduling options.
 --
@@ -268,8 +278,14 @@ scheduleM pendings scheduler = case pendings of
             (k, pendings') = genericDeleteAt pendings i
 
 
-fork :: RTSM s r () -> RTSM s r ()
-fork forkable = RTSM $ \k -> Pending $ \pendings -> scheduleM (k () : unRTSM forkable (\() -> Pending scheduleM) : pendings)
+newtype ThreadId = ThreadId Nat
+                 deriving (Eq, Ord, Show, Typeable)
+
+forkIO :: RTSM s r () -> RTSM s r (MC.ThreadId (RTSM s r))
+forkIO forkable = RTSM $ \k -> Pending $ \pendings -> scheduleM (k undefined : unRTSM forkable (\() -> Pending scheduleM) : pendings)
+
+myThreadId :: RTSM s r (MC.ThreadId (RTSM s r))
+myThreadId = RTSM $ \k -> Pending $ \pendings -> undefined
 
 
 data RTSVarState s r a = RTSVarState {
@@ -325,7 +341,7 @@ example1 = do
 example2 = do
     v_in <- newRTSVar 1336
     v_out <- newEmptyRTSVar
-    fork $ do
+    forkIO $ do
         x <- takeRTSVar v_in
         yield
         putRTSVar v_out (x + 1)
@@ -334,8 +350,8 @@ example2 = do
 -- An example with a race: depending on scheduling, this either returns "Hello" or "World"
 example3 = do
     v <- newEmptyRTSVar
-    fork $ putRTSVar v "Hello"
-    fork $ putRTSVar v "World"
+    forkIO $ putRTSVar v "Hello"
+    forkIO $ putRTSVar v "World"
     takeRTSVar v
 
 

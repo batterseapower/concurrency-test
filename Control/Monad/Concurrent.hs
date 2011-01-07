@@ -1,9 +1,11 @@
-{-# LANGUAGE TypeFamilies, RankNTypes #-}
+{-# LANGUAGE FlexibleContexts, TypeFamilies, RankNTypes #-}
 module Control.Monad.Concurrent where
 
 import Control.Exception (Exception(..), SomeException)
 import qualified Control.Exception as IO
 import qualified Control.Concurrent as IO
+
+import Data.Typeable (Typeable)
 
 import Prelude hiding (catch)
 
@@ -47,7 +49,11 @@ instance MonadException IO where
     onException = IO.onException
 
 
-class Monad m => MonadConcurrent m where
+class (Eq (ThreadId m),
+       Ord (ThreadId m),
+       Show (ThreadId m),
+       Typeable (ThreadId m),
+       Monad m) => MonadConcurrent m where
     type ThreadId m :: *
     
     forkIO :: m () -> m (ThreadId m)
