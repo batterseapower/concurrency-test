@@ -120,6 +120,12 @@ genericDeleteAt (x:xs) n = if n == 0 then (x, xs) else second (x:) (genericDelet
 
 newtype Scheduler = Scheduler { schedule :: forall s r. [Pending s r] -> (Scheduler, Pending s r, [Pending s r]) }
 
+unfair :: Scheduler
+unfair = Scheduler schedule
+  where
+    schedule []     = error "Blocked indefinitely!"
+    schedule (x:xs) = (unfair, x, xs)
+
 roundRobin :: Scheduler
 roundRobin = Scheduler schedule
   where
@@ -149,7 +155,7 @@ schedulerStreemed (SS sss) = Scheduler (schedule sss)
 -- | A pending coroutine
 --
 -- You almost always want to use (scheduleM (k : pendings)) rather than (unPending k pendings) because
--- scheduleM gives QuickCheck a chance to try other schedulings, wherease using unPending forces control
+-- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
 newtype Pending s r = Pending { unPending :: [Pending s r] -> Scheduler -> ST s r }
 newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Pending s r }
@@ -241,5 +247,15 @@ example2 = do
         putRTSVar v_out (x + 1)
     takeRTSVar v_out
 
+-- An example with a race: depending on scheduling, this either returns "Hello" or "World"
+example3 = do
+    v <- newEmptyRTSVar
+    fork $ putRTSVar v "Hello"
+    fork $ putRTSVar v "World"
+    takeRTSVar v
+
 main :: IO ()
-main = print $ runRTSM roundRobin example2
+main = do
+    -- Demonstrates the presence of a data race - these two invocations return different results
+    print $ runRTSM unfair example3
+    print $ runRTSM roundRobin example3
