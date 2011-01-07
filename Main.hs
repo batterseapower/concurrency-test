@@ -10,8 +10,7 @@ import Data.List
 
 import Test.LazySmallCheck
 
---import Evaluated
-evaluated _ = True -- FIXME: RtClosureInspect not exported :(
+import Data.TagBits
 
 
 newtype Nat = Nat { unNat :: Int }
@@ -78,7 +77,7 @@ dequeue (Queue (x:xs) [])     = Just (rev xs x [])
 data Stream a = a :< Stream a
 
 instance Show a => Show (Stream a) where
-    show xs | not (evaluated xs) = "..."
+    show xs | not (unsafeIsEvaluated xs) = "..."
     show (x :< xs) = show x ++ " :< " ++ show xs
 
 instance Serial a => Serial (Stream a) where
