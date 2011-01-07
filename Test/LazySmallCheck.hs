@@ -6,7 +6,7 @@
 module Test.LazySmallCheck
   ( Serial(series) -- :: class
   , Series         -- :: type Series a = Int -> Cons a
-  , Cons(..)       -- :: *
+  , Cons           -- :: *
   , cons           -- :: a -> Series a
   , (><)           -- :: Series (a -> b) -> Series a -> Series b
   , empty          -- :: Series a
@@ -19,9 +19,13 @@ module Test.LazySmallCheck
   , cons4          -- :: ...
   , cons5          -- :: ...
   , Testable       -- :: class
+  , Report         -- :: * -> *
   , depthCheck     -- :: Testable a => Int -> a -> IO ()
+  , depthCheck'    -- :: Testable a => Int -> a -> IO (Report a)
   , smallCheck     -- :: Testable a => Int -> a -> IO ()
+  , smallCheck'    -- :: Testable a => Int -> a -> IO (Report a)
   , test           -- :: Testable a => a -> IO ()
+  , test'          -- :: Testable a => a -> IO (Report a)
   , (==>)          -- :: Bool -> Bool -> Bool
   , Property       -- :: *
   , lift           -- :: Bool -> Property
