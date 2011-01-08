@@ -316,7 +316,8 @@ maskWith :: Interruptibility -> ((forall a. RTSM s r a -> RTSM s r a) -> RTSM s 
 maskWith interruptible while = RTSM $ \k tid masking throw -> unRTSM (while (\unmask -> RTSM $ \k tid _masking -> unRTSM unmask k tid masking)) (\b -> Pending $ \resumables next_tid scheduler -> scheduleM ((tid, masking, Uninterruptible, throw, k b) : resumables) next_tid scheduler) tid masking' throw
   where
     -- NB: must call scheduleM after exiting the masked region so we can pump asynchronous exceptions that may have accrued while masked
-    -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump: this would help reduce the scheduler search space
+    -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump which are *newly enabled*
+    -- by the transition in masking states: this would help reduce the scheduler search space
     masking' = case interruptible of Uninterruptible -> E.MaskedUninterruptible
                                      Interruptible   -> E.MaskedInterruptible
 
