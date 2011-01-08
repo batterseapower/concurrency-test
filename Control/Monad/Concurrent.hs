@@ -18,6 +18,7 @@ class Monad m => MonadException m where
     -- TODO: add other functions from Control.Exception
     
     throwIO :: Exception e => e -> m a
+    throwTo :: Exception e => ThreadId m -> e -> m ()
     catch :: Exception e => m a -> (e -> m a) -> m a
     
     bracket :: m a -> (a -> m b) -> (a -> m c) -> m c
@@ -41,6 +42,7 @@ instance MonadException IO where
     mask_ = IO.mask_
     
     throwIO = IO.throwIO
+    throwTo = IO.throwTo
     catch = IO.catch
     
     bracket = IO.bracket

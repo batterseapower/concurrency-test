@@ -1,4 +1,4 @@
-{-# LANGUAGE Rank2Types, GeneralizedNewtypeDeriving, TypeFamilies, DeriveDataTypeable #-}
+{-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies #-}
 
 import Control.Arrow ((***), first, second)
 import Control.Applicative (Applicative(..))
@@ -11,7 +11,8 @@ import Data.List
 import Data.Monoid (mempty)
 import Data.Foldable (Foldable(foldMap))
 import Data.Traversable (Traversable(traverse))
-import Data.Typeable (Typeable(..))
+import Data.Typeable (Typeable(..), mkTyCon, mkTyConApp)
+import qualified Data.Map as M
 
 import Test.LazySmallCheck
 import Test.QuickCheck hiding (Success, Result, (><))
@@ -245,11 +246,17 @@ instance Traversable Result where
 -- You almost always want to use (scheduleM (k : pendings)) rather than (unPending k pendings) because
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
-newtype Pending s r = Pending { unPending :: [Pending s r] -> Nat -> Scheduler -> ST s (Result r) }
-newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Nat -> (E.SomeException -> Pending s r) -> Pending s r }
+newtype Pending s r = Pending { unPending :: [Pending s r] -- ^ Runnable threads that are eligible for execution
+                                          -> Nat           -- ^ Next ThreadId to allocate
+                                          -> Scheduler     -- ^ Current scheduler, used for at the next rescheduling point
+                                          -> ST s (Result r) }
+newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r)               -- ^ Continuation: how we should continue after we have our result
+                                   -> ThreadId s r                     -- ^ ThreadId of this thread of execution
+                                   -> (E.SomeException -> Pending s r) -- ^ Exception handling continuation
+                                   -> Pending s r }
 
 runRTSM :: Scheduler -> (forall s. RTSM s r r) -> Result r
-runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _next_tid _scheduler -> return (Success x)) 0 unhandledException) [] 1 scheduler)
+runRTSM scheduler mx = runST (newThreadId 0 >>= \tid -> unPending (unRTSM mx (\x -> Pending $ \_pendings _next_tid _scheduler -> return (Success x)) tid unhandledException) [] 1 scheduler)
 
 unhandledException :: E.SomeException -> Pending s r
 unhandledException e = Pending $ \_ _ _ -> return (UnhandledException e)
@@ -267,12 +274,14 @@ instance Monad (RTSM s r) where
     mx >>= fxmy = RTSM $ \k_y tid throw -> unRTSM mx (\x -> unRTSM (fxmy x) k_y tid throw) tid throw
 
 instance MC.MonadException (RTSM s r) where
-    mask = undefined -- FIXME: asynchronous exceptions
+    mask = mask
+    
     throwIO = throwIO
+    throwTo = throwTo
     catch = catch
 
 instance MC.MonadConcurrent (RTSM s r) where
-    type MC.ThreadId (RTSM s r) = ThreadId
+    type MC.ThreadId (RTSM s r) = ThreadId s r
 
     forkIO = forkIO
     myThreadId = myThreadId
@@ -280,8 +289,14 @@ instance MC.MonadConcurrent (RTSM s r) where
     yield = yield
 
 
+mask :: ((forall a. RTSM s r a -> RTSM s r a) -> RTSM s r b) -> RTSM s r b
+mask while = RTSM $ \k tid throw -> undefined -- FIXME: must consider mask mode in throwTo!
+
 throwIO :: E.Exception e => e -> RTSM s r a
 throwIO e = RTSM $ \_k _tid throw -> throw (E.SomeException e)
+
+throwTo :: E.Exception e => ThreadId s r -> e -> RTSM s r ()
+throwTo target_tid e = RTSM $ \k tid throw -> if target_tid == tid then throw (E.SomeException e) else undefined -- FIXME
 
 catch :: E.Exception e => RTSM s r a -> (e -> RTSM s r a) -> RTSM s r a
 catch mx handle = RTSM $ \k tid throw -> unRTSM mx k tid $ \e -> maybe (throw e) (\e -> unRTSM (handle e) k tid throw) (E.fromException e)
@@ -303,14 +318,29 @@ scheduleM pendings next_tid scheduler = case pendings of
             (k, pendings') = genericDeleteAt pendings i
 
 
-newtype ThreadId = ThreadId Nat
-                 deriving (Eq, Ord, Show, Typeable)
+data ThreadId s r = ThreadId Nat (STRef s (Queue (E.SomeException, Pending s r)))
+
+instance Eq (ThreadId s r) where
+    ThreadId n1 _ == ThreadId n2 _ = n1 == n2
+
+instance Ord (ThreadId s r) where
+    ThreadId n1 _ `compare` ThreadId n2 _ = n1 `compare` n2
+
+instance Show (ThreadId s r) where
+    show (ThreadId n _) = show n
+
+instance Typeable (ThreadId s r) where
+    typeOf _ = mkTyConApp (mkTyCon "ThreadId") [] -- TODO: update with correct FQN when I move the datatype
+
+newThreadId :: Nat -> ST s (ThreadId s r)
+newThreadId tid = fmap (ThreadId tid) $ newSTRef emptyQueue
+
 
 forkIO :: RTSM s r () -> RTSM s r (MC.ThreadId (RTSM s r))
-forkIO forkable = RTSM $ \k _tid _throw -> Pending $ \pendings next_tid -> scheduleM (k (ThreadId next_tid) : unRTSM forkable (\() -> Pending scheduleM) next_tid unhandledException : pendings) (next_tid + 1)
+forkIO forkable = RTSM $ \k _tid _throw -> Pending $ \pendings next_tid scheduler -> newThreadId next_tid >>= \tid' -> scheduleM (k tid' : unRTSM forkable (\() -> Pending scheduleM) tid' unhandledException : pendings) (next_tid + 1) scheduler
 
 myThreadId :: RTSM s r (MC.ThreadId (RTSM s r))
-myThreadId = RTSM $ \k tid _throw -> k (ThreadId tid)
+myThreadId = RTSM $ \k tid _throw -> k tid
 
 
 data RTSVarState s r a = RTSVarState {
