@@ -1,7 +1,7 @@
 {-# LANGUAGE FlexibleContexts, TypeFamilies, RankNTypes #-}
 module Control.Monad.Concurrent where
 
-import Control.Exception (Exception(..), SomeException)
+import Control.Exception (Exception(..), SomeException, MaskingState)
 import qualified Control.Exception as IO
 import qualified Control.Concurrent as IO
 
@@ -14,6 +14,12 @@ class Monad m => MonadException m where
     mask :: ((forall a. m a -> m a) -> m b) -> m b
     mask_ :: m a -> m a
     mask_ io = mask $ \_ -> io
+
+    uninterruptibleMask :: ((forall a. m a -> m a) -> m b) -> m b
+    uninterruptibleMask_ :: m a -> m a
+    uninterruptibleMask_ io = uninterruptibleMask $ \_ -> io
+
+    getMaskingState :: m MaskingState
 
     -- TODO: add other functions from Control.Exception
     
@@ -40,6 +46,9 @@ class Monad m => MonadException m where
 instance MonadException IO where
     mask = IO.mask
     mask_ = IO.mask_
+    uninterruptibleMask = IO.uninterruptibleMask
+    uninterruptibleMask_ = IO.uninterruptibleMask_
+    getMaskingState = IO.getMaskingState
     
     throwIO = IO.throwIO
     throwTo = IO.throwTo

@@ -278,6 +278,8 @@ instance Monad (RTSM s r) where
 
 instance MC.MonadException (RTSM s r) where
     mask = mask
+    uninterruptibleMask = uninterruptibleMask
+    getMaskingState = getMaskingState
     
     throwIO = throwIO
     throwTo = throwTo
@@ -293,7 +295,16 @@ instance MC.MonadConcurrent (RTSM s r) where
 
 
 mask :: ((forall a. RTSM s r a -> RTSM s r a) -> RTSM s r b) -> RTSM s r b
-mask while = RTSM $ \k tid throw -> undefined -- FIXME: must consider mask mode in throwTo!
+mask = maskWith E.MaskedInterruptible
+
+uninterruptibleMask :: ((forall a. RTSM s r a -> RTSM s r a) -> RTSM s r b) -> RTSM s r b
+uninterruptibleMask = maskWith E.MaskedUninterruptible
+
+getMaskingState :: RTSM s r E.MaskingState
+getMaskingState = RTSM $ \k tid throw -> undefined -- FIXME
+
+maskWith :: E.MaskingState -> ((forall a. RTSM s r a -> RTSM s r a) -> RTSM s r b) -> RTSM s r b
+maskWith masking while = RTSM $ \k tid throw -> undefined -- FIXME: must consider mask mode in throwTo!
 
 throwIO :: E.Exception e => e -> RTSM s r a
 throwIO e = RTSM $ \_k _tid throw -> snd (unwind throw (E.SomeException e))
