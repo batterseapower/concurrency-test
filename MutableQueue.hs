@@ -50,7 +50,7 @@ replaceFront :: MutableQueue s a -> Maybe (Node s a) -> Node s a -> ST s ()
 replaceFront q mb_front back = writeSTRef (front_ref q) (maybe Empty (\front -> NonEmpty front back) mb_front)
 
 
-data Location s a = L Integer (MutableQueue s a)
+data Location s a = L Integer (MutableQueue s a) -- TODO: could probably implement constant-time delete if I could tolerate more pointers
                   deriving (Eq)
 
 delete :: Location s a -> ST s (Maybe a)
