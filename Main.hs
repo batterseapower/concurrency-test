@@ -313,9 +313,10 @@ getMaskingState :: RTSM s r E.MaskingState
 getMaskingState = RTSM $ \k _tid masking _throw -> k masking
 
 maskWith :: Interruptibility -> ((forall a. RTSM s r a -> RTSM s r a) -> RTSM s r b) -> RTSM s r b
-maskWith interruptible while = RTSM $ \k tid masking throw -> unRTSM (while (\unmask -> RTSM $ \k tid _masking -> unRTSM unmask k tid masking)) k tid masking' throw
+maskWith interruptible while = RTSM $ \k tid masking throw -> unRTSM (while (\unmask -> RTSM $ \k tid _masking -> unRTSM unmask k tid masking)) (\b -> Pending $ \resumables next_tid scheduler -> scheduleM ((tid, masking, Uninterruptible, throw, k b) : resumables) next_tid scheduler) tid masking' throw
   where
-    -- FIXME: pump asynchronous exceptions once we are out of the scope of a mask?
+    -- NB: must call scheduleM after exiting the masked region so we can pump asynchronous exceptions that may have accrued while masked
+    -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump: this would help reduce the scheduler search space
     masking' = case interruptible of Uninterruptible -> E.MaskedUninterruptible
                                      Interruptible   -> E.MaskedInterruptible
 
