@@ -3,7 +3,7 @@
 import Control.Arrow ((***), first, second)
 import Control.Applicative (Applicative(..))
 import Control.Monad
-import Control.Exception
+import qualified Control.Exception as E
 
 import Control.Monad.ST
 import Data.STRef
@@ -41,20 +41,20 @@ instance Arbitrary StdGen where
 
 {-# NOINLINE exceptionTrace #-}
 exceptionTrace :: a -> a
-exceptionTrace x = unsafePerformIO (evaluate x `catch` (\e -> trace ("Exception in pure code: " ++ show (e :: SomeException)) $ throw e))
+exceptionTrace x = unsafePerformIO (E.evaluate x `E.catch` (\e -> trace ("Exception in pure code: " ++ show (e :: E.SomeException)) $ E.throw e))
 
 -- I used to use unsafeIsEvaluated to decide where to put in "...", but that pruned too heavily because
 -- I couldn't show the schedule before it was actually poked on and those thunks turned into real values.
 {-# NOINLINE showsExplored #-}
 showsExplored :: (a -> ShowS) -> a -> ShowS
-showsExplored shows x = unsafePerformIO $ fmap (maybe (showString "...") shows) $ tryIf isLSCError (evaluate x)
+showsExplored shows x = unsafePerformIO $ fmap (maybe (showString "...") shows) $ tryIf isLSCError (E.evaluate x)
   where
     -- Looked at the LSC code to see what sort of errors it was generating...
-    isLSCError (ErrorCall ('\0':msg)) = True
-    isLSCError _                      = False
+    isLSCError (E.ErrorCall ('\0':msg)) = True
+    isLSCError _                        = False
     
-    tryIf :: Exception e => (e -> Bool) -> IO a -> IO (Maybe a)
-    tryIf p act = fmap (either (\() -> Nothing) Just) $ tryJust (\e -> guard (p e) >> return ()) act
+    tryIf :: E.Exception e => (e -> Bool) -> IO a -> IO (Maybe a)
+    tryIf p act = fmap (either (\() -> Nothing) Just) $ E.tryJust (\e -> guard (p e) >> return ()) act
 
 
 newtype Nat = Nat { unNat :: Int }
@@ -203,10 +203,18 @@ instance Arbitrary Scheduler where
 instance Serial Scheduler where
     series = cons schedulerStreemed >< series
 
-
+-- FIXME: think about what happens if we get something other than Success on a non-main thread.
+-- I'm not even sure what the current behaviour is, but I think it stops us immediately.
 data Result a = Success a
               | BlockedIndefinitely
-              deriving (Eq, Show)
+              | UnhandledException E.SomeException
+              deriving (Show)
+
+instance Eq a => Eq (Result a) where
+    Success x1            == Success x2            = x1 == x2
+    BlockedIndefinitely   == BlockedIndefinitely   = True
+    UnhandledException e1 == UnhandledException e2 = show e1 == show e2
+    _                     == _                     = False
 
 instance Functor Result where
     fmap = liftM
@@ -217,16 +225,19 @@ instance Applicative Result where
 
 instance Monad Result where
     return = Success
-    Success x           >>= f = f x
-    BlockedIndefinitely >>= f = BlockedIndefinitely
+    Success x              >>= f = f x
+    BlockedIndefinitely    >>= _ = BlockedIndefinitely
+    (UnhandledException e) >>= _ = UnhandledException e
 
 instance Foldable Result where
-    foldMap f (Success x)         = f x
-    foldMap _ BlockedIndefinitely = mempty
+    foldMap f (Success x)            = f x
+    foldMap _ BlockedIndefinitely    = mempty
+    foldMap _ (UnhandledException _) = mempty
 
 instance Traversable Result where
-    traverse f (Success x)         = pure Success <*> f x
-    traverse _ BlockedIndefinitely = pure BlockedIndefinitely
+    traverse f (Success x)            = pure Success <*> f x
+    traverse _ BlockedIndefinitely    = pure BlockedIndefinitely
+    traverse _ (UnhandledException e) = pure (UnhandledException e)
 
 
 -- | A pending coroutine
@@ -235,10 +246,13 @@ instance Traversable Result where
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
 newtype Pending s r = Pending { unPending :: [Pending s r] -> Nat -> Scheduler -> ST s (Result r) }
-newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Nat -> Pending s r }
+newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r) -> Nat -> (E.SomeException -> Pending s r) -> Pending s r }
 
 runRTSM :: Scheduler -> (forall s. RTSM s r r) -> Result r
-runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _next_tid _scheduler -> return (Success x)) 0) [] 1 scheduler)
+runRTSM scheduler mx = runST (unPending (unRTSM mx (\x -> Pending $ \_pendings _next_tid _scheduler -> return (Success x)) 0 unhandledException) [] 1 scheduler)
+
+unhandledException :: E.SomeException -> Pending s r
+unhandledException e = Pending $ \_ _ _ -> return (UnhandledException e)
 
 
 instance Functor (RTSM s r) where
@@ -249,8 +263,13 @@ instance Applicative (RTSM s r) where
    (<*>) = ap
 
 instance Monad (RTSM s r) where
-    return x = RTSM $ \k _tid -> k x
-    mx >>= fxmy = RTSM $ \k_y tid -> unRTSM mx (\x -> unRTSM (fxmy x) k_y tid) tid
+    return x = RTSM $ \k _tid _throw -> k x
+    mx >>= fxmy = RTSM $ \k_y tid throw -> unRTSM mx (\x -> unRTSM (fxmy x) k_y tid throw) tid throw
+
+instance MC.MonadException (RTSM s r) where
+    mask = undefined -- FIXME: asynchronous exceptions
+    throwIO = throwIO
+    catch = catch
 
 instance MC.MonadConcurrent (RTSM s r) where
     type MC.ThreadId (RTSM s r) = ThreadId
@@ -261,6 +280,12 @@ instance MC.MonadConcurrent (RTSM s r) where
     yield = yield
 
 
+throwIO :: E.Exception e => e -> RTSM s r a
+throwIO e = RTSM $ \_k _tid throw -> throw (E.SomeException e)
+
+catch :: E.Exception e => RTSM s r a -> (e -> RTSM s r a) -> RTSM s r a
+catch mx handle = RTSM $ \k tid throw -> unRTSM mx k tid $ \e -> maybe (throw e) (\e -> unRTSM (handle e) k tid throw) (E.fromException e)
+
 -- | Give up control to the scheduler: yields should be used at every point where it is useful to allow QuickCheck
 -- to try several different scheduling options.
 --
@@ -268,7 +293,7 @@ instance MC.MonadConcurrent (RTSM s r) where
 -- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
 -- operation and get the same results.
 yield :: RTSM s r ()
-yield = RTSM $ \k _tid -> Pending $ \pendings -> scheduleM (k () : pendings)
+yield = RTSM $ \k _tid _throw -> Pending $ \pendings -> scheduleM (k () : pendings)
 
 scheduleM :: [Pending s r] -> Nat -> Scheduler -> ST s (Result r)
 scheduleM pendings next_tid scheduler = case pendings of
@@ -282,10 +307,10 @@ newtype ThreadId = ThreadId Nat
                  deriving (Eq, Ord, Show, Typeable)
 
 forkIO :: RTSM s r () -> RTSM s r (MC.ThreadId (RTSM s r))
-forkIO forkable = RTSM $ \k tid -> Pending $ \pendings next_tid -> scheduleM (k (ThreadId next_tid) : unRTSM forkable (\() -> Pending scheduleM) next_tid : pendings) (next_tid + 1)
+forkIO forkable = RTSM $ \k _tid _throw -> Pending $ \pendings next_tid -> scheduleM (k (ThreadId next_tid) : unRTSM forkable (\() -> Pending scheduleM) next_tid unhandledException : pendings) (next_tid + 1)
 
 myThreadId :: RTSM s r (MC.ThreadId (RTSM s r))
-myThreadId = RTSM $ \k tid -> k (ThreadId tid)
+myThreadId = RTSM $ \k tid _throw -> k (ThreadId tid)
 
 
 data RTSVarState s r a = RTSVarState {
@@ -304,10 +329,10 @@ newRTSVar :: a -> RTSM s r (RTSVar s r a)
 newRTSVar = newRTSVarInternal . Just
 
 newRTSVarInternal :: Maybe a -> RTSM s r (RTSVar s r a)
-newRTSVarInternal mb_x = RTSM $ \k _tid -> Pending $ \pendings next_tid scheduler -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings next_tid scheduler -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
+newRTSVarInternal mb_x = RTSM $ \k _tid _throw -> Pending $ \pendings next_tid scheduler -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) pendings next_tid scheduler -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
 
 takeRTSVar :: RTSVar s r a -> RTSM s r a
-takeRTSVar rtsvar = RTSM $ \k _tid -> Pending $ \pendings next_tid scheduler -> do
+takeRTSVar rtsvar = RTSM $ \k _tid _throw -> Pending $ \pendings next_tid scheduler -> do
     state <- readSTRef (unRTSVar rtsvar)
     case rtsvar_data state of
        -- NB: we must guarantee that the woken thread doing a putRTSVar (if any) completes its operation since takeMVar has this guarantee
@@ -318,7 +343,7 @@ takeRTSVar rtsvar = RTSM $ \k _tid -> Pending $ \pendings next_tid scheduler -> 
       Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue k (rtsvar_takers state) }) >> scheduleM pendings next_tid scheduler
 
 putRTSVar :: RTSVar s r a -> a -> RTSM s r ()
-putRTSVar rtsvar x = RTSM $ \k _tid -> Pending $ \pendings next_tid scheduler -> do
+putRTSVar rtsvar x = RTSM $ \k _tid _throw -> Pending $ \pendings next_tid scheduler -> do
     state <- readSTRef (unRTSVar rtsvar)
     case rtsvar_data state of
        -- NB: we must guarantee that the woken thread doing a takeRTSVar (if any) completes its operation since putMVar has this guarantee
