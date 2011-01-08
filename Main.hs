@@ -7,6 +7,7 @@ import qualified Control.Exception as E
 
 import Control.Monad.ST
 import Data.STRef
+import qualified Data.STQueue as STQ
 import Data.List
 import Data.Monoid (mempty)
 import Data.Foldable (Foldable(foldMap))
@@ -45,6 +46,9 @@ thd3 (_, _, c) = c
 
 fth4 :: (a, b, c, d) -> d
 fth4 (_, _, _, d) = d
+
+pamf :: Functor f => f a -> (a -> b) -> f b
+pamf = flip fmap
 
 
 {-# NOINLINE exceptionTrace #-}
@@ -255,6 +259,7 @@ instance Traversable Result where
 -- flow to continue in the current thread.
 type Resumable s r = (ThreadId s r, E.MaskingState, Interruptibility, Unwinder s r, Pending s r)
 newtype Pending s r = Pending { unPending :: [Resumable s r] -- ^ Runnable threads that are eligible for execution, and their multi-step unwinders
+                                          -> [Suspended s r] -- ^ Suspended threads that may or may not have been resumed yet: this is necessary because we may want to deliver asyncronous exceptions to them. As such, everything in this list is Interruptible. TODO: is the other list always Uninterruptible?
                                           -> Nat             -- ^ Next ThreadId to allocate
                                           -> Scheduler       -- ^ Current scheduler, used for at the next rescheduling point
                                           -> ST s (Result r) } -- TODO: Pending is itself almost a monad
@@ -267,10 +272,10 @@ newtype RTSM s r a = RTSM { unRTSM :: (a -> Pending s r)  -- ^ Continuation: how
 newtype Unwinder s r = Unwinder { unwind :: E.SomeException -> (E.MaskingState, Interruptibility, Unwinder s r, Pending s r) }
 
 runRTSM :: Scheduler -> (forall s. RTSM s r r) -> Result r
-runRTSM scheduler mx = runST (newThreadId 0 >>= \tid -> unPending (unRTSM mx (\x -> Pending $ \_resumables _next_tid _scheduler -> return (Success x)) tid E.Unmasked unhandledException) [] 1 scheduler)
+runRTSM scheduler mx = runST (newThreadId 0 >>= \tid -> unPending (unRTSM mx (\x -> Pending $ \_resumables _suspendeds _next_tid _scheduler -> return (Success x)) tid E.Unmasked unhandledException) [] [] 1 scheduler)
 
 unhandledException :: Unwinder s r
-unhandledException = Unwinder $ \e -> (E.Unmasked, Interruptible {- Don't think it matters either way -}, unhandledException, Pending $ \_ _ _ -> return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
+unhandledException = Unwinder $ \e -> (E.Unmasked, Interruptible {- Don't think it matters either way -}, unhandledException, Pending $ \_resumables _suspendeds _next_tid _scheduler -> return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
 
 
 instance Functor (RTSM s r) where
@@ -313,7 +318,7 @@ getMaskingState :: RTSM s r E.MaskingState
 getMaskingState = RTSM $ \k _tid masking _throw -> k masking
 
 maskWith :: Interruptibility -> ((forall a. RTSM s r a -> RTSM s r a) -> RTSM s r b) -> RTSM s r b
-maskWith interruptible while = RTSM $ \k tid masking throw -> unRTSM (while (\unmask -> RTSM $ \k tid _masking -> unRTSM unmask k tid masking)) (\b -> Pending $ \resumables next_tid scheduler -> scheduleM ((tid, masking, Uninterruptible, throw, k b) : resumables) next_tid scheduler) tid masking' throw
+maskWith interruptible while = RTSM $ \k tid masking throw -> unRTSM (while (\unmask -> RTSM $ \k tid _masking -> unRTSM unmask k tid masking)) (\b -> Pending $ \resumables suspendeds next_tid scheduler -> scheduleM ((tid, masking, Uninterruptible, throw, k b) : resumables) suspendeds next_tid scheduler) tid masking' throw
   where
     -- NB: must call scheduleM after exiting the masked region so we can pump asynchronous exceptions that may have accrued while masked
     -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump which are *newly enabled*
@@ -326,7 +331,7 @@ throwIO e = RTSM $ \_k _tid _masking throw -> fth4 (unwind throw (E.SomeExceptio
 
 -- FIXME: I can't throwTo to interrupt a thread blocked on e.g. a MVar.. crap
 throwTo :: E.Exception e => ThreadId s r -> e -> RTSM s r ()
-throwTo target_tid e = RTSM $ \k tid masking throw -> if target_tid == tid {- See GHC #4888: we always throw an exception regardless of the mask mode -} then fth4 (unwind throw (E.SomeException e)) else Pending $ \resumables next_tid scheduler -> enqueueAsyncException target_tid (E.SomeException e) (tid, masking, Interruptible, throw, k ()) >> scheduleM resumables next_tid scheduler
+throwTo target_tid e = RTSM $ \k tid masking throw -> if target_tid == tid {- See GHC #4888: we always throw an exception regardless of the mask mode -} then fth4 (unwind throw (E.SomeException e)) else Pending $ \resumables suspendeds next_tid scheduler -> enqueueAsyncException target_tid (E.SomeException e) (tid, masking, Interruptible, throw, k ()) >>= \suspended -> scheduleM resumables (suspended:suspendeds) next_tid scheduler
 
 catch :: E.Exception e => RTSM s r a -> (e -> RTSM s r a) -> RTSM s r a
 catch mx handle = RTSM $ \k tid masking throw -> unRTSM mx k tid masking $ Unwinder $ \e -> maybe (unwind throw e) (\e -> (masking, Uninterruptible, throw, unRTSM (handle e) k tid masking throw)) (E.fromException e)
@@ -340,12 +345,13 @@ catch mx handle = RTSM $ \k tid masking throw -> unRTSM mx k tid masking $ Unwin
 yield :: RTSM s r ()
 yield = RTSM $ \k tid masking throw -> Pending $ \resumables -> scheduleM ((tid, masking, Uninterruptible, throw, k ()) : resumables)
 
-scheduleM :: [Resumable s r] -> Nat -> Scheduler -> ST s (Result r)
-scheduleM resumables next_tid scheduler = case resumables of
+scheduleM :: [Resumable s r] -> [Suspended s r] -> Nat -> Scheduler -> ST s (Result r)
+scheduleM resumables suspendeds next_tid scheduler = case resumables of
     [] -> return BlockedIndefinitely
     _  -> do
+        -- FIXME: deliver exceptions (if any) to suspendeds
         (pending, resumables'') <- dequeueAsyncExceptions tid (masking, interruptibility, throw, pending)
-        unPending pending (resumables'' ++ resumables') next_tid scheduler'
+        unPending pending (resumables'' ++ resumables') suspendeds next_tid scheduler'
       where (scheduler', i) = schedule scheduler (genericLength resumables - 1)
             ((tid, masking, interruptibility, throw, pending), resumables') = genericDeleteAt resumables i
 
@@ -362,11 +368,14 @@ dequeueAsyncExceptions tid = go []
       | canThrow masking interruptibility = do
         mb_e <- dequeueAsyncException tid
         case mb_e of
-          Nothing             -> return (pending, resumables)
-          Just (e, resumable) -> go (resumable:resumables) (unwind throw e)
+          Nothing                -> return (pending, resumables)
+          Just (e, mb_resumable) -> go (maybe id (:) mb_resumable resumables) (unwind throw e)
      | otherwise = return (pending, resumables)
 
-data ThreadId s r = ThreadId Nat (STRef s (Queue (E.SomeException, Resumable s r)))
+--type Suspended s r = STRef s (Maybe (Resumable s r))
+newtype Suspended s r = Suspended { interrupt :: ST s (Unwinder s r) } -- NB: must be used as a one-shot thing (once you grab the unwinder, the thread will be dumped from the suspended position and enqueued as pending by the user of Suspended)
+
+data ThreadId s r = ThreadId Nat (STRef s (Queue (E.SomeException, STRef s (Maybe (Resumable s r)))))
 
 instance Eq (ThreadId s r) where
     ThreadId n1 _ == ThreadId n2 _ = n1 == n2
@@ -383,34 +392,35 @@ instance Typeable (ThreadId s r) where
 newThreadId :: Nat -> ST s (ThreadId s r)
 newThreadId tid = fmap (ThreadId tid) $ newSTRef emptyQueue
 
-enqueueAsyncException :: ThreadId s r -> E.SomeException -> Resumable s r -> ST s ()
-enqueueAsyncException (ThreadId _ ref) e pending = do
+enqueueAsyncException :: ThreadId s r -> E.SomeException -> Resumable s r -> ST s (Suspended s r)
+enqueueAsyncException (ThreadId _ ref) e resumable = do
     asyncs <- readSTRef ref
-    writeSTRef ref (queue (e, pending) asyncs)
+    resumable_ref <- newSTRef (Just resumable)
+    writeSTRef ref (queue (e, resumable_ref) asyncs)
+    return $ Suspended $ readSTRef resumable_ref >>= \(Just (_, _, _, throw, _)) -> writeSTRef resumable_ref Nothing >> return throw
 
-dequeueAsyncException :: ThreadId s r -> ST s (Maybe (E.SomeException, Resumable s r))
+dequeueAsyncException :: ThreadId s r -> ST s (Maybe (E.SomeException, Maybe (Resumable s r)))
 dequeueAsyncException (ThreadId _ ref) = do
     asyncs <- readSTRef ref
     case dequeue asyncs of
-      Nothing               -> return Nothing
-      Just (async, asyncs') -> writeSTRef ref asyncs' >> return (Just async)
+      Nothing                            -> return Nothing
+      Just ((e, resumable_ref), asyncs') -> writeSTRef ref asyncs' >> readSTRef resumable_ref >>= \mb_resumable -> return (Just (e, mb_resumable))
 
 
 forkIO :: RTSM s r () -> RTSM s r (MC.ThreadId (RTSM s r))
-forkIO forkable = RTSM $ \k tid masking throw -> Pending $ \resumables next_tid scheduler -> newThreadId next_tid >>= \tid' -> scheduleM ((tid, masking, Uninterruptible, throw, k tid') : (tid', masking, Uninterruptible, unhandledException, unRTSM forkable (\() -> Pending scheduleM) tid' masking unhandledException) : resumables) (next_tid + 1) scheduler
+forkIO forkable = RTSM $ \k tid masking throw -> Pending $ \resumables suspendeds next_tid scheduler -> newThreadId next_tid >>= \tid' -> scheduleM ((tid, masking, Uninterruptible, throw, k tid') : (tid', masking, Uninterruptible, unhandledException, unRTSM forkable (\() -> Pending scheduleM) tid' masking unhandledException) : resumables) suspendeds (next_tid + 1) scheduler
 
 myThreadId :: RTSM s r (MC.ThreadId (RTSM s r))
 myThreadId = RTSM $ \k tid _throw _masking -> k tid
 
 
-data RTSVarState s r a = RTSVarState {
-    rtsvar_data :: Maybe a,
-    -- MVars have guaranteed FIFO semantics, so that's what we do here
-    rtsvar_putters :: Queue (a, Resumable s r),
-    rtsvar_takers :: Queue (a -> Resumable s r)
+-- TODO: I could detect more unreachable states if I find that a RTSVar currently blocking a Pending gets GCed
+data RTSVar s r a = RTSVar {
+    rtsvar_data :: STRef s (Maybe a),
+    -- MVars have guaranteed FIFO semantics, hence the queues
+    rtsvar_putters :: STQ.STQueue s (a, Resumable s r),
+    rtsvar_takers  :: STQ.STQueue s (a -> Resumable s r)
   }
-
-newtype RTSVar s r a = RTSVar { unRTSVar :: STRef s (RTSVarState s r a) } -- TODO: I could detect more unreachable states if I find that a RTSVar currently blocking a Pending gets GCed
 
 newEmptyRTSVar :: RTSM s r (RTSVar s r a)
 newEmptyRTSVar = newRTSVarInternal Nothing
@@ -419,29 +429,42 @@ newRTSVar :: a -> RTSM s r (RTSVar s r a)
 newRTSVar = newRTSVarInternal . Just
 
 newRTSVarInternal :: Maybe a -> RTSM s r (RTSVar s r a)
-newRTSVarInternal mb_x = RTSM $ \k _tid _masking _throw -> Pending $ \resumables next_tid scheduler -> newSTRef (RTSVarState mb_x emptyQueue emptyQueue) >>= \stref -> unPending (k (RTSVar stref)) resumables next_tid scheduler -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
+newRTSVarInternal mb_x = RTSM $ \k _tid _masking _throw -> Pending $ \resumables suspendeds next_tid scheduler -> do
+    data_ref <- newSTRef Nothing
+    putter_queue <- STQ.new
+    taker_queue <- STQ.new
+    -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
+    unPending (k (RTSVar data_ref putter_queue taker_queue)) resumables suspendeds next_tid scheduler
 
 takeRTSVar :: RTSVar s r a -> RTSM s r a
-takeRTSVar rtsvar = RTSM $ \k tid masking throw -> Pending $ \resumables next_tid scheduler -> do
-    state <- readSTRef (unRTSVar rtsvar)
-    case rtsvar_data state of
+takeRTSVar rtsvar = RTSM $ \k tid masking throw -> Pending $ \resumables suspendeds next_tid scheduler -> do
+    dat <- readSTRef (rtsvar_data rtsvar)
+    case dat of
        -- NB: we must guarantee that the woken thread doing a putRTSVar (if any) completes its operation since takeMVar has this guarantee
-      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_putters = putters' }) >> scheduleM ((tid, masking, Uninterruptible, throw, k x) : resumables') next_tid scheduler
-        where (dat', putters', resumables') = case dequeue (rtsvar_putters state) of
-                  Nothing                      -> (Nothing, emptyQueue, resumables)
-                  Just ((x, putter), putters') -> (Just x, putters', putter : resumables)
-      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_takers = queue (\x -> (tid, masking, Interruptible, throw, k x)) (rtsvar_takers state) }) >> scheduleM resumables next_tid scheduler
+      Just x  -> do
+          (dat', resumables') <- STQ.dequeue (rtsvar_putters rtsvar) `pamf` \it -> case it of
+              Nothing          -> (Nothing, resumables)
+              Just (x, putter) -> (Just x, putter : resumables)
+          writeSTRef (rtsvar_data rtsvar) dat'
+          scheduleM ((tid, masking, Uninterruptible, throw, k x) : resumables') suspendeds next_tid scheduler
+      Nothing -> do
+          loc <- STQ.enqueue (\x -> (tid, masking, Interruptible, throw, k x)) (rtsvar_takers rtsvar)
+          scheduleM resumables suspendeds next_tid scheduler -- FIXME: add a suspenden
 
 putRTSVar :: RTSVar s r a -> a -> RTSM s r ()
-putRTSVar rtsvar x = RTSM $ \k tid masking throw -> Pending $ \resumables next_tid scheduler -> do
-    state <- readSTRef (unRTSVar rtsvar)
-    case rtsvar_data state of
+putRTSVar rtsvar x = RTSM $ \k tid masking throw -> Pending $ \resumables suspendeds next_tid scheduler -> do
+    dat <- readSTRef (rtsvar_data rtsvar)
+    case dat of
        -- NB: we must guarantee that the woken thread doing a takeRTSVar (if any) completes its operation since putMVar has this guarantee
-      Nothing -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_data = dat', rtsvar_takers = takers' }) >> scheduleM ((tid, masking, Uninterruptible, throw, k ()) : resumables') next_tid scheduler
-        where (dat', takers', resumables') = case dequeue (rtsvar_takers state) of
-                  Nothing                     -> (Just x, emptyQueue, resumables)
-                  Just (mk_resumable, putters') -> (Nothing, putters', mk_resumable x : resumables)
-      Just x  -> writeSTRef (unRTSVar rtsvar) (state { rtsvar_putters = queue (x, (tid, masking, Interruptible, throw, k ())) (rtsvar_putters state) } ) >> scheduleM resumables next_tid scheduler
+      Nothing -> do
+          (dat', resumables') <- STQ.dequeue (rtsvar_takers rtsvar) `pamf` \it -> case it of
+              Nothing           -> (Just x, resumables)
+              Just mk_resumable -> (Nothing, mk_resumable x : resumables)
+          writeSTRef (rtsvar_data rtsvar) dat'
+          scheduleM ((tid, masking, Uninterruptible, throw, k ()) : resumables') suspendeds next_tid scheduler
+      Just x  -> do
+          loc <- STQ.enqueue (x, (tid, masking, Interruptible, throw, k ())) (rtsvar_putters rtsvar)
+          scheduleM resumables suspendeds next_tid scheduler -- FIXME: add a suspenden
 
 
 example1 = do
