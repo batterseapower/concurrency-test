@@ -43,8 +43,11 @@ dequeue q = do
       Empty -> return Nothing
       NonEmpty front back -> do
           mb_backwards <- readSTRef (backwards_ref front)
-          writeSTRef (front_ref q) (maybe Empty (\backwards -> NonEmpty backwards back) mb_backwards)
+          replaceFront q mb_backwards back
           return (Just (value front))
+
+replaceFront :: MutableQueue s a -> Maybe (Node s a) -> Node s a -> ST s ()
+replaceFront q mb_front back = writeSTRef (front_ref q) (maybe Empty (\front -> NonEmpty front back) mb_front)
 
 
 data Location s a = L Integer (MutableQueue s a)
@@ -55,14 +58,12 @@ delete (L location_i q) = do
     front <- readSTRef (front_ref q)
     case front of
       Empty               -> return Nothing
-      NonEmpty front back -> do
-         go (Just front) (\mb_front -> writeSTRef (front_ref q) (maybe Empty (\front -> NonEmpty front back) mb_front))
+      NonEmpty front back -> go front (\mb_front -> replaceFront q mb_front back)
   where
-    go Nothing     _ = return Nothing
-    go (Just this) write_this_ref
+    go this write_this_ref
       | location_i /= location this = do
         mb_backwards <- readSTRef (backwards_ref this)
-        go mb_backwards (writeSTRef (backwards_ref this))
+        maybe (return Nothing) (\backwards -> go backwards (writeSTRef (backwards_ref this))) mb_backwards
       | otherwise                   = do
         mb_backwards <- readSTRef (backwards_ref this)
         write_this_ref mb_backwards
