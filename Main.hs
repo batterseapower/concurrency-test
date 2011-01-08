@@ -296,7 +296,7 @@ throwIO :: E.Exception e => e -> RTSM s r a
 throwIO e = RTSM $ \_k _tid throw -> throw (E.SomeException e)
 
 throwTo :: E.Exception e => ThreadId s r -> e -> RTSM s r ()
-throwTo target_tid e = RTSM $ \k tid throw -> if target_tid == tid then throw (E.SomeException e) else undefined -- FIXME
+throwTo target_tid e = RTSM $ \k tid throw -> if target_tid == tid then throw (E.SomeException e) else Pending $ \pendings next_tid scheduler -> enqueueAsyncException target_tid (E.SomeException e) (k ()) >> scheduleM pendings next_tid scheduler
 
 catch :: E.Exception e => RTSM s r a -> (e -> RTSM s r a) -> RTSM s r a
 catch mx handle = RTSM $ \k tid throw -> unRTSM mx k tid $ \e -> maybe (throw e) (\e -> unRTSM (handle e) k tid throw) (E.fromException e)
@@ -313,7 +313,7 @@ yield = RTSM $ \k _tid _throw -> Pending $ \pendings -> scheduleM (k () : pendin
 scheduleM :: [Pending s r] -> Nat -> Scheduler -> ST s (Result r)
 scheduleM pendings next_tid scheduler = case pendings of
     [] -> return BlockedIndefinitely
-    _  -> unPending k pendings' next_tid scheduler'
+    _  -> unPending k pendings' next_tid scheduler' -- FIXME: dequeueAsyncException
       where (scheduler', i) = schedule scheduler (genericLength pendings - 1)
             (k, pendings') = genericDeleteAt pendings i
 
@@ -334,6 +334,18 @@ instance Typeable (ThreadId s r) where
 
 newThreadId :: Nat -> ST s (ThreadId s r)
 newThreadId tid = fmap (ThreadId tid) $ newSTRef emptyQueue
+
+enqueueAsyncException :: ThreadId s r -> E.SomeException -> Pending s r -> ST s ()
+enqueueAsyncException (ThreadId _ ref) e pending = do
+    asyncs <- readSTRef ref
+    writeSTRef ref (queue (e, pending) asyncs)
+
+dequeueAsyncException :: ThreadId s r -> ST s (Maybe (E.SomeException, Pending s r))
+dequeueAsyncException (ThreadId _ ref) = do
+    asyncs <- readSTRef ref
+    case dequeue asyncs of
+      Nothing               -> return Nothing
+      Just (async, asyncs') -> writeSTRef ref asyncs' >> return (Just async)
 
 
 forkIO :: RTSM s r () -> RTSM s r (MC.ThreadId (RTSM s r))
