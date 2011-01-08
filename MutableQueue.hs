@@ -2,19 +2,21 @@ import Control.Monad.ST
 import Data.STRef
 
 
+-- Initiall based on a Haskell translation of <http://www.java-tips.org/java-se-tips/java.lang/linked-list-based-queue-implementation.html>
 
 
 data Node s a = Node { location :: Integer, value :: a, backwards_ref :: STRef s (Maybe (Node s a)) }
 
-data MutableQueue s a = MQ { next_location_ref :: STRef s Integer, front_ref :: STRef s (Maybe (Node s a)), back_ref :: STRef s (Maybe (Node s a)) }
+data Front s a = Empty
+               | NonEmpty (Node s a) (Node s a)
+data MutableQueue s a = MQ { next_location_ref :: STRef s Integer, front_ref :: STRef s (Front s a) }
                       deriving (Eq)
 
 new :: ST s (MutableQueue s a)
 new = do
     next_location_ref <- newSTRef 0
-    front_ref <- newSTRef Nothing
-    back_ref <- newSTRef Nothing
-    return $ MQ next_location_ref front_ref back_ref
+    front_ref <- newSTRef Empty
+    return $ MQ next_location_ref front_ref
 
 enqueue :: a -> MutableQueue s a -> ST s (Location s a)
 enqueue x q = do
@@ -24,18 +26,13 @@ enqueue x q = do
     backwards_ref' <- newSTRef Nothing
     let node = Node next_location_i x backwards_ref'
     
-    mb_front <- readSTRef (front_ref q)
-    case mb_front of
-      Nothing    -> do
-          writeSTRef (back_ref q)  (Just node)
-          writeSTRef (front_ref q) (Just node)
-      Just front -> do
-          mb_back <- readSTRef (back_ref q)
-          case mb_back of
-            Nothing   -> error "???"
-            Just back -> do
-              writeSTRef (back_ref q)         (Just node)
-              writeSTRef (backwards_ref back) (Just node)
+    front <- readSTRef (front_ref q)
+    case front of
+      Empty -> do
+          writeSTRef (front_ref q) $ NonEmpty node node
+      NonEmpty front back -> do
+          writeSTRef (front_ref q) $ NonEmpty front node
+          writeSTRef (backwards_ref back) (Just node)
     
     return $ L next_location_i q
 
@@ -43,10 +40,10 @@ dequeue :: MutableQueue s a -> ST s (Maybe a)
 dequeue q = do
     mb_front <- readSTRef (front_ref q)
     case mb_front of
-      Nothing    -> return Nothing
-      Just front -> do
-          backwards <- readSTRef (backwards_ref front)
-          writeSTRef (front_ref q) backwards
+      Empty -> return Nothing
+      NonEmpty front back -> do
+          mb_backwards <- readSTRef (backwards_ref front)
+          writeSTRef (front_ref q) (maybe Empty (\backwards -> NonEmpty backwards back) mb_backwards)
           return (Just (value front))
 
 
@@ -54,18 +51,22 @@ data Location s a = L Integer (MutableQueue s a)
                   deriving (Eq)
 
 delete :: Location s a -> ST s (Maybe a)
-delete (L location_i q) = go (front_ref q)
+delete (L location_i q) = do
+    front <- readSTRef (front_ref q)
+    case front of
+      Empty               -> return Nothing
+      NonEmpty front back -> do
+         go (Just front) (\mb_front -> writeSTRef (front_ref q) (maybe Empty (\front -> NonEmpty front back) mb_front))
   where
-    go this_ref = do
-      mb_this <- readSTRef this_ref
-      case mb_this of
-        Nothing -> return Nothing
-        Just this
-          | location_i /= location this -> go (backwards_ref this)
-          | otherwise                   -> do
-            mb_backwards <- readSTRef (backwards_ref this)
-            writeSTRef this_ref mb_backwards
-            return (Just (value this))
+    go Nothing     _ = return Nothing
+    go (Just this) write_this_ref
+      | location_i /= location this = do
+        mb_backwards <- readSTRef (backwards_ref this)
+        go mb_backwards (writeSTRef (backwards_ref this))
+      | otherwise                   = do
+        mb_backwards <- readSTRef (backwards_ref this)
+        write_this_ref mb_backwards
+        return (Just (value this))
 
 
 main = print $ runST $ do
