@@ -6,6 +6,7 @@ import Control.Monad
 import qualified Control.Exception as E
 
 import Control.Monad.ST
+import Control.Monad.ST.Class
 import Data.STRef
 import qualified Data.STQueue as STQ
 import Data.List
@@ -369,6 +370,13 @@ scheduleM suspendeds resumables next_tid scheduler = case resumables of
         unPending pending (resumables'' ++ resumables') next_tid scheduler'
       where (scheduler', i) = schedule scheduler (genericLength resumables - 1)
             ((tid, masking, throw, pending), resumables') = genericDeleteAt resumables i
+  where
+    --foo = do
+    --  STQ.mapMaybeM suspendeds
+
+instance MonadST (RTSM s r) where
+    type StateThread (RTSM s r) = s
+    liftST st = RTSM $ \k _tid _masking _suspendeds _throw -> Pending $ \resumables next_tid scheduler -> st >>= \x -> unPending (k x) resumables next_tid scheduler
 
 dequeueAsyncExceptions :: ThreadId s r -> (E.MaskingState, Interruptibility, Unwinder s r, Pending s r) -> ST s (Pending s r, [Resumable s r])
 dequeueAsyncExceptions tid = go []

@@ -3,7 +3,9 @@ module Data.STQueue (
     new, enqueue, dequeue, delete
   ) where
 
+import Control.Monad
 import Control.Monad.ST
+import Control.Monad.ST.Class
 import Data.STRef
 
 
@@ -28,6 +30,11 @@ enqueue x q = do
     next_location_i <- readSTRef (next_location_ref q)
     writeSTRef (next_location_ref q) (next_location_i + 1)
     
+    enqueueInLocation next_location_i x q
+    return $ L next_location_i q
+
+enqueueInLocation :: Integer -> a -> STQueue s a -> ST s ()
+enqueueInLocation next_location_i x q = do
     backwards_ref' <- newSTRef Nothing
     let node = Node next_location_i x backwards_ref'
     
@@ -38,21 +45,34 @@ enqueue x q = do
       NonEmpty front back -> do
           writeSTRef (front_ref q) $ NonEmpty front node
           writeSTRef (backwards_ref back) (Just node)
-    
-    return $ L next_location_i q
 
 dequeue :: STQueue s a -> ST s (Maybe a)
-dequeue q = do
+dequeue = fmap (fmap snd) . dequeueWithLocation
+
+dequeueWithLocation :: STQueue s a -> ST s (Maybe (Integer, a))
+dequeueWithLocation q = do
     mb_front <- readSTRef (front_ref q)
     case mb_front of
       Empty -> return Nothing
       NonEmpty front back -> do
           mb_backwards <- readSTRef (backwards_ref front)
           replaceFront q mb_backwards back
-          return (Just (value front))
+          return (Just (location front, value front))
 
 replaceFront :: STQueue s a -> Maybe (Node s a) -> Node s a -> ST s ()
 replaceFront q mb_front back = writeSTRef (front_ref q) (maybe Empty (\front -> NonEmpty front back) mb_front)
+
+
+mapMaybeM :: MonadST m => (a -> m (Maybe a)) -> STQueue (StateThread m) a -> m ()
+mapMaybeM f q = go []
+  where
+    go ys = do
+      mb_x <- liftST $ dequeueWithLocation q
+      case mb_x of
+        Nothing -> forM_ (reverse ys) $ \(loc, y) -> liftST $ enqueueInLocation loc y q
+        Just (loc, x) -> do
+          mb_y <- f x
+          go (maybe ys (\y -> (loc, y) : ys) mb_y)
 
 
 data Location s a = L Integer (STQueue s a) -- TODO: could probably implement constant-time delete if I could tolerate more pointers
