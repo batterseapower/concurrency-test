@@ -152,24 +152,24 @@ genericIndexStream (x :< xs) n = if n == 0 then x else genericIndexStream xs (n 
 
 
 -- | A stream suitable for use for guiding the scheduler. The natural number stored in the nth element
--- of one of the Stream (Streem Nat) we contain is drawn uniformly from the range [0,n].
+-- of one of the Stream (Stream Nat) we contain is drawn uniformly from the range [0,n].
 --
 -- In one use of the scheduler, all but one element of each Stream will be discarded, since they correspond
 -- to schedulings for executions with more or less pending processes than we actually saw
-newtype SchedulerStreem = SS { unSS :: Stream (Nat, SchedulerStreem) }
+newtype SchedulerStream = SS { unSS :: Stream (Nat, SchedulerStream) }
                         deriving (Show)
 
-instance Serial SchedulerStreem where
-    series = streamSeries
+instance Serial SchedulerStream where
+    series = streamSeries0
       where
-        streemSeries :: Nat -> Series (Nat, SchedulerStreem)
-        streemSeries n = (cons (,) >< (\_ -> drawnFrom [0..n]) >< streamSeries) . (+1)
+        streamSeries' :: Nat -> Series (Nat, SchedulerStream)
+        streamSeries' n = (cons (,) >< (\_ -> drawnFrom [0..n]) >< streamSeries0) . (+1)
     
-        streamSeries :: Series SchedulerStreem
-        streamSeries = streamSeries' 0
+        streamSeries0 :: Series SchedulerStream
+        streamSeries0 = streamSeriesN 0
     
-        streamSeries' :: Nat -> Series SchedulerStreem
-        streamSeries' n = cons (\n ss -> SS ((:<) n (unSS ss))) >< streemSeries n >< streamSeries' (n + 1)
+        streamSeriesN :: Nat -> Series SchedulerStream
+        streamSeriesN n = cons (\n ss -> SS ((:<) n (unSS ss))) >< streamSeries' n >< streamSeriesN (n + 1)
 
 
 genericDeleteAt :: Num i => [a] -> i -> (a, [a])
@@ -193,9 +193,9 @@ streamed :: Stream Nat -> Scheduler
 streamed (i :< is) = Scheduler schedule
   where schedule n = (streamed is, i `mod` n) -- A bit unsatisfactory because I really want a uniform chance of scheduling the available threads
 
-schedulerStreemed :: SchedulerStreem -> Scheduler
-schedulerStreemed (SS sss) = Scheduler schedule
-  where schedule n = (schedulerStreemed sss', i)
+schedulerStreamed :: SchedulerStream -> Scheduler
+schedulerStreamed (SS sss) = Scheduler schedule
+  where schedule n = (schedulerStreamed sss', i)
           where (i, sss') = genericIndexStream sss n
 
 randomised :: StdGen -> Scheduler
@@ -211,7 +211,7 @@ instance Arbitrary Scheduler where
     shrink _ = []
 
 instance Serial Scheduler where
-    series = cons schedulerStreemed >< series
+    series = cons schedulerStreamed >< series
 
 -- TODO: think about what happens if we get something other than Success on a non-main thread.
 -- I'm not even sure what the current behaviour is, but I think it stops us immediately.
@@ -565,7 +565,7 @@ testScheduleSafe :: Eq r => (forall s. RTSM s r r) -> IO ()
 -- Cuter:
 --testScheduleSafe act = test $ \sched -> expected == runRTSM sched act
 -- More flexible:
-testScheduleSafe act = test $ \ss -> trace (show ss) $ expected == runRTSM (schedulerStreemed ss) act
+testScheduleSafe act = test $ \ss -> trace (show ss) $ expected == runRTSM (schedulerStreamed ss) act
 -- Working:
 --testScheduleSafe act = quickCheck $ \gen -> expected == runRTSM (randomised gen) act
   where expected = runRTSM roundRobin act
