@@ -282,7 +282,7 @@ runRTSM scheduler mx = runST $ do
     unPending (unRTSM mx (\x -> Pending $ \_resumables _next_tid _scheduler -> return (Success x)) tid E.Unmasked suspendeds unhandledException) [] 1 scheduler
 
 unhandledException :: Unwinder s r
-unhandledException = Unwinder $ \e -> (E.Unmasked, Interruptible {- Don't think it matters either way -}, unhandledException, Pending $ \_resumables _next_tid _scheduler -> return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
+unhandledException = Unwinder $ \e -> (E.Unmasked, Uninterruptible {- Don't think it matters either way -}, unhandledException, Pending $ \_resumables _next_tid _scheduler -> return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
 
 
 instance Functor (RTSM s r) where
@@ -463,7 +463,7 @@ takeRTSVar rtsvar = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumab
           writeSTRef (rtsvar_data rtsvar) dat'
           scheduleM suspendeds ((tid, masking, Uninterruptible, throw, k x) : resumables') next_tid scheduler
       Nothing -> do
-          rec { success_loc <- STQ.enqueue (interrupt_loc, \x -> (tid, masking, Interruptible, throw, k x)) (rtsvar_takers rtsvar)
+          rec { success_loc <- STQ.enqueue (interrupt_loc, \x -> (tid, masking, Uninterruptible, throw, k x)) (rtsvar_takers rtsvar)
                 -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
               ; interrupt_loc <- flip STQ.enqueue suspendeds $ Suspended $ STQ.delete success_loc >>= \(Just _) -> return throw
               ; return () }
@@ -481,7 +481,7 @@ putRTSVar rtsvar x = RTSM $ \k tid masking suspendeds throw -> Pending $ \resuma
           writeSTRef (rtsvar_data rtsvar) dat'
           scheduleM suspendeds ((tid, masking, Uninterruptible, throw, k ()) : resumables') next_tid scheduler
       Just x  -> do
-          rec { success_loc <- STQ.enqueue (interrupt_loc, x, (tid, masking, Interruptible, throw, k ())) (rtsvar_putters rtsvar)
+          rec { success_loc <- STQ.enqueue (interrupt_loc, x, (tid, masking, Uninterruptible, throw, k ())) (rtsvar_putters rtsvar)
                 -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
               ; interrupt_loc <- flip STQ.enqueue suspendeds $ Suspended $ STQ.delete success_loc >>= \(Just _) -> return throw
               ; return () }
