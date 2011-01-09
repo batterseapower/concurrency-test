@@ -1,6 +1,7 @@
 module Data.STQueue (
     STQueue, Location,
-    new, enqueue, dequeue, delete
+    new, enqueue, dequeue, delete,
+    mapMaybeM
   ) where
 
 import Control.Monad
