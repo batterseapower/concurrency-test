@@ -345,7 +345,7 @@ throwTo target_tid e = RTSM $ \k tid masking suspendeds throw -> if target_tid =
                                                                     -- recover by still delivering the exception but ensure that doing so does not cause the pending list to change
                                                                     rec { let kill_suspended = STQ.delete interrupt_loc >>= \(Just _) -> return ()
                                                                         ; kill_blocked <- enqueueAsyncException target_tid (E.SomeException e) (tid, masking, throw, k ()) kill_suspended
-                                                                        ; interrupt_loc <- flip STQ.enqueue suspendeds $ Suspended $ kill_blocked >> return throw
+                                                                        ; interrupt_loc <- flip STQ.enqueue suspendeds (tid, Interrupter $ kill_blocked >> return throw)
                                                                         ; return () }
                                                                     scheduleM suspendeds resumables next_tid scheduler
 
@@ -371,8 +371,14 @@ scheduleM suspendeds resumables next_tid scheduler = case resumables of
       where (scheduler', i) = schedule scheduler (genericLength resumables - 1)
             ((tid, masking, throw, pending), resumables') = genericDeleteAt resumables i
   where
-    --foo = do
-    --  STQ.mapMaybeM suspendeds
+    -- foo = do
+    --       flip STQ.mapMaybeM suspendeds $ \(tid, interrupter) -> do
+    --           interrupt interrupter
+    --           return
+
+
+data Writer m 
+
 
 instance MonadST (RTSM s r) where
     type StateThread (RTSM s r) = s
@@ -396,7 +402,8 @@ dequeueAsyncExceptions tid = go []
      | otherwise = return (pending, resumables)
 
 --type Suspended s r = STRef s (Maybe (Resumable s r))
-newtype Suspended s r = Suspended { interrupt :: ST s (Unwinder s r) } -- NB: must be used as a one-shot thing (once you grab the unwinder, the thread will be dumped from the suspended position and enqueued as pending by the user of Suspended)
+newtype Interrupter s r = Interrupter { interrupt :: ST s (Unwinder s r) } -- NB: must be used as a one-shot thing (once you grab the unwinder, the thread will be dumped from the suspended position and enqueued as pending by the user of Suspended)
+type Suspended s r = (ThreadId s r, Interrupter s r)
 
 data ThreadId s r = ThreadId Nat (STRef s (Queue (E.SomeException, STRef s (Maybe (ST s (Resumable s r))))))
 
@@ -416,9 +423,9 @@ newThreadId :: Nat -> ST s (ThreadId s r)
 newThreadId tid = fmap (ThreadId tid) $ newSTRef emptyQueue
 
 enqueueAsyncException :: ThreadId s r -> E.SomeException -> Resumable s r -> ST s () -> ST s (ST s ())
-enqueueAsyncException (ThreadId _ ref) e resumable stop_suspension = do
+enqueueAsyncException (ThreadId _ ref) e resumable notify_block_complete = do
     asyncs <- readSTRef ref
-    resumable_ref <- newSTRef $ Just $ stop_suspension >> return resumable
+    resumable_ref <- newSTRef $ Just $ notify_block_complete >> return resumable
     writeSTRef ref (queue (e, resumable_ref) asyncs)
     return $ readSTRef resumable_ref >>= \(Just _) -> writeSTRef resumable_ref Nothing
 
@@ -473,7 +480,7 @@ takeRTSVar rtsvar = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumab
       Nothing -> do
           rec { success_loc <- STQ.enqueue (interrupt_loc, \x -> (tid, masking, throw, k x)) (rtsvar_takers rtsvar)
                 -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
-              ; interrupt_loc <- flip STQ.enqueue suspendeds $ Suspended $ STQ.delete success_loc >>= \(Just _) -> return throw
+              ; interrupt_loc <- flip STQ.enqueue suspendeds (tid, Interrupter $ STQ.delete success_loc >>= \(Just _) -> return throw)
               ; return () }
           scheduleM suspendeds resumables next_tid scheduler
 
@@ -491,7 +498,7 @@ putRTSVar rtsvar x = RTSM $ \k tid masking suspendeds throw -> Pending $ \resuma
       Just x  -> do
           rec { success_loc <- STQ.enqueue (interrupt_loc, x, (tid, masking, throw, k ())) (rtsvar_putters rtsvar)
                 -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
-              ; interrupt_loc <- flip STQ.enqueue suspendeds $ Suspended $ STQ.delete success_loc >>= \(Just _) -> return throw
+              ; interrupt_loc <- flip STQ.enqueue suspendeds (tid, Interrupter $ STQ.delete success_loc >>= \(Just _) -> return throw)
               ; return () }
           scheduleM suspendeds resumables next_tid scheduler
 
