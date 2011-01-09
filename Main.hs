@@ -151,32 +151,25 @@ genericIndexStream :: Num i => Stream a -> i -> a
 genericIndexStream (x :< xs) n = if n == 0 then x else genericIndexStream xs (n - 1)
 
 
-data Streem a = Streem a (Stream (Streem a))
-              deriving (Show)
-
-instance Serial a => Serial (Streem a) where
-    series = cons2 Streem . (+1)
-
-
 -- | A stream suitable for use for guiding the scheduler. The natural number stored in the nth element
 -- of one of the Stream (Streem Nat) we contain is drawn uniformly from the range [0,n].
 --
 -- In one use of the scheduler, all but one element of each Stream will be discarded, since they correspond
 -- to schedulings for executions with more or less pending processes than we actually saw
-newtype SchedulerStreem = SS { unSS :: Stream (Streem Nat) }
+newtype SchedulerStreem = SS { unSS :: Stream (Nat, SchedulerStreem) }
                         deriving (Show)
 
 instance Serial SchedulerStreem where
-    series = cons SS >< streamSeries . (+1)
+    series = streamSeries
       where
-        streemSeries :: Nat -> Series (Streem Nat)
-        streemSeries n = (cons Streem >< (\_ -> drawnFrom [0..n]) >< streamSeries) . (+1)
+        streemSeries :: Nat -> Series (Nat, SchedulerStreem)
+        streemSeries n = (cons (,) >< (\_ -> drawnFrom [0..n]) >< streamSeries) . (+1)
     
-        streamSeries :: Series (Stream (Streem Nat))
+        streamSeries :: Series SchedulerStreem
         streamSeries = streamSeries' 0
     
-        streamSeries' :: Nat -> Series (Stream (Streem Nat))
-        streamSeries' n = cons (:<) >< streemSeries n >< streamSeries' (n + 1)
+        streamSeries' :: Nat -> Series SchedulerStreem
+        streamSeries' n = cons (\n ss -> SS ((:<) n (unSS ss))) >< streemSeries n >< streamSeries' (n + 1)
 
 
 genericDeleteAt :: Num i => [a] -> i -> (a, [a])
@@ -202,8 +195,8 @@ streamed (i :< is) = Scheduler schedule
 
 schedulerStreemed :: SchedulerStreem -> Scheduler
 schedulerStreemed (SS sss) = Scheduler schedule
-  where schedule n = (schedulerStreemed (SS sss'), i)
-          where Streem i sss' = genericIndexStream sss n
+  where schedule n = (schedulerStreemed sss', i)
+          where (i, sss') = genericIndexStream sss n
 
 randomised :: StdGen -> Scheduler
 randomised gen = Scheduler schedule
