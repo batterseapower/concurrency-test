@@ -325,7 +325,7 @@ getMaskingState :: RTSM s r E.MaskingState
 getMaskingState = RTSM $ \k _tid masking _suspendeds _throw -> k masking
 
 maskWith :: Interruptibility -> ((forall a. RTSM s r a -> RTSM s r a) -> RTSM s r b) -> RTSM s r b
-maskWith interruptible while = RTSM $ \k tid masking suspendeds throw -> unRTSM (while (\unmask -> RTSM $ \k tid _masking -> unRTSM unmask k tid masking)) (\b -> Pending $ \resumables next_tid scheduler -> scheduleM ((tid, masking, Uninterruptible, throw, k b) : resumables) next_tid scheduler) tid masking' suspendeds throw
+maskWith interruptible while = RTSM $ \k tid masking suspendeds throw -> unRTSM (while (\unmask -> RTSM $ \k tid _masking -> unRTSM unmask k tid masking)) (\b -> Pending $ \resumables next_tid scheduler -> scheduleM suspendeds ((tid, masking, Uninterruptible, throw, k b) : resumables) next_tid scheduler) tid masking' suspendeds throw
   where
     -- NB: must call scheduleM after exiting the masked region so we can pump asynchronous exceptions that may have accrued while masked
     -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump which are *newly enabled*
@@ -346,7 +346,7 @@ throwTo target_tid e = RTSM $ \k tid masking suspendeds throw -> if target_tid =
                                                                         ; kill_blocked <- enqueueAsyncException target_tid (E.SomeException e) (tid, masking, Interruptible, throw, k ()) kill_suspended
                                                                         ; interrupt_loc <- flip STQ.enqueue suspendeds $ Suspended $ kill_blocked >> return throw
                                                                         ; return () }
-                                                                    scheduleM resumables next_tid scheduler
+                                                                    scheduleM suspendeds resumables next_tid scheduler
 
 catch :: E.Exception e => RTSM s r a -> (e -> RTSM s r a) -> RTSM s r a
 catch mx handle = RTSM $ \k tid masking suspendeds throw -> unRTSM mx k tid masking suspendeds $ Unwinder $ \e -> maybe (unwind throw e) (\e -> (masking, Uninterruptible, throw, unRTSM (handle e) k tid masking suspendeds throw)) (E.fromException e)
@@ -358,10 +358,10 @@ catch mx handle = RTSM $ \k tid masking suspendeds throw -> unRTSM mx k tid mask
 -- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
 -- operation and get the same results.
 yield :: RTSM s r ()
-yield = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumables -> scheduleM ((tid, masking, Uninterruptible, throw, k ()) : resumables)
+yield = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumables -> scheduleM suspendeds ((tid, masking, Uninterruptible, throw, k ()) : resumables)
 
-scheduleM :: [Resumable s r] -> Nat -> Scheduler -> ST s (Result r)
-scheduleM resumables next_tid scheduler = case resumables of
+scheduleM :: STQ.STQueue s (Suspended s r) -> [Resumable s r] -> Nat -> Scheduler -> ST s (Result r)
+scheduleM suspendeds resumables next_tid scheduler = case resumables of
     [] -> return BlockedIndefinitely
     _  -> do
         -- FIXME: deliver exceptions (if any) to suspendeds: this is the only thing that lets us interrupt blocked operations
@@ -423,7 +423,7 @@ dequeueAsyncException (ThreadId _ ref) = do
 
 
 forkIO :: RTSM s r () -> RTSM s r (MC.ThreadId (RTSM s r))
-forkIO forkable = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumables next_tid scheduler -> newThreadId next_tid >>= \tid' -> scheduleM ((tid, masking, Uninterruptible, throw, k tid') : (tid', masking, Uninterruptible, unhandledException, unRTSM forkable (\() -> Pending scheduleM) tid' masking suspendeds unhandledException) : resumables) (next_tid + 1) scheduler
+forkIO forkable = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumables next_tid scheduler -> newThreadId next_tid >>= \tid' -> scheduleM suspendeds ((tid, masking, Uninterruptible, throw, k tid') : (tid', masking, Uninterruptible, unhandledException, unRTSM forkable (\() -> Pending (scheduleM suspendeds)) tid' masking suspendeds unhandledException) : resumables) (next_tid + 1) scheduler
 
 myThreadId :: RTSM s r (MC.ThreadId (RTSM s r))
 myThreadId = RTSM $ \k tid  _masking _suspendeds _throw -> k tid
@@ -461,13 +461,13 @@ takeRTSVar rtsvar = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumab
               Nothing                         -> return (Nothing, resumables)
               Just (interrupt_loc, x, putter) -> STQ.delete interrupt_loc >>= \(Just _) -> return (Just x, putter : resumables)
           writeSTRef (rtsvar_data rtsvar) dat'
-          scheduleM ((tid, masking, Uninterruptible, throw, k x) : resumables') next_tid scheduler
+          scheduleM suspendeds ((tid, masking, Uninterruptible, throw, k x) : resumables') next_tid scheduler
       Nothing -> do
           rec { success_loc <- STQ.enqueue (interrupt_loc, \x -> (tid, masking, Interruptible, throw, k x)) (rtsvar_takers rtsvar)
                 -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
               ; interrupt_loc <- flip STQ.enqueue suspendeds $ Suspended $ STQ.delete success_loc >>= \(Just _) -> return throw
               ; return () }
-          scheduleM resumables next_tid scheduler
+          scheduleM suspendeds resumables next_tid scheduler
 
 putRTSVar :: RTSVar s r a -> a -> RTSM s r ()
 putRTSVar rtsvar x = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumables next_tid scheduler -> do
@@ -479,13 +479,13 @@ putRTSVar rtsvar x = RTSM $ \k tid masking suspendeds throw -> Pending $ \resuma
               Nothing                            -> return (Just x, resumables)
               Just (interrupt_loc, mk_resumable) -> STQ.delete interrupt_loc >>= \(Just _) -> return (Nothing, mk_resumable x : resumables)
           writeSTRef (rtsvar_data rtsvar) dat'
-          scheduleM ((tid, masking, Uninterruptible, throw, k ()) : resumables') next_tid scheduler
+          scheduleM suspendeds ((tid, masking, Uninterruptible, throw, k ()) : resumables') next_tid scheduler
       Just x  -> do
           rec { success_loc <- STQ.enqueue (interrupt_loc, x, (tid, masking, Interruptible, throw, k ())) (rtsvar_putters rtsvar)
                 -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
               ; interrupt_loc <- flip STQ.enqueue suspendeds $ Suspended $ STQ.delete success_loc >>= \(Just _) -> return throw
               ; return () }
-          scheduleM resumables next_tid scheduler
+          scheduleM suspendeds resumables next_tid scheduler
 
 
 example1 = do
