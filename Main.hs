@@ -362,6 +362,7 @@ yield :: RTSM s r ()
 yield = RTSM $ \k tid masking suspendeds throw -> Pending $ \resumables -> scheduleM suspendeds ((tid, masking, throw, k ()) : resumables)
 
 -- TODO: rethink treatment of asynchronous exceptions.. for one thing we are not generating enough schedulings
+-- TODO: it might be cool to have a mode that generates random asynchronous exceptions to try to crash other threads
 scheduleM :: STQ.STQueue s (Suspended s r) -> [Resumable s r] -> Nat -> Scheduler -> ST s (Result r)
 scheduleM suspendeds resumables next_tid scheduler = do
     -- Deliver asynchronous exceptions to suspended threads (if they have any such exceptions pending).
