@@ -5,7 +5,7 @@ import Control.Exception (Exception(..), SomeException, MaskingState)
 import qualified Control.Exception as IO
 import qualified Control.Concurrent as IO
 
-import Data.Typeable (Typeable)
+import Data.Typeable (Typeable, Typeable1)
 
 import Prelude hiding (catch)
 
@@ -81,7 +81,9 @@ instance MonadConcurrent IO where
     yield = IO.yield
 
 
-class (MonadException m, MonadConcurrent m) => MonadMVar m where
+-- TODO: we need to have (forall a. Eq (MVar m) a) in the context here but we can't
+class (Typeable1 (MVar m),
+       MonadException m, MonadConcurrent m) => MonadMVar m where
     type MVar m :: * -> *
     
     newEmptyMVar :: m (MVar m a)

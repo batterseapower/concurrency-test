@@ -1,5 +1,5 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DoRec #-}
+{-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DoRec, DeriveDataTypeable, StandaloneDeriving #-}
 module Control.Monad.RTS where
 
 import Control.Applicative (Applicative(..))
@@ -16,7 +16,7 @@ import Data.STRef
 import qualified Data.STQueue as STQ
 import Data.Traversable (Traversable(traverse))
 import qualified Data.Traversable as Traversable
-import Data.Typeable (Typeable(..), mkTyCon, mkTyConApp)
+import Data.Typeable (Typeable(..), Typeable1(..), mkTyCon, mkTyConApp)
 
 import Debug.Trace
 
@@ -364,7 +364,7 @@ instance Show (ThreadId s r) where
     show (ThreadId n _) = show n
 
 instance Typeable (ThreadId s r) where
-    typeOf _ = mkTyConApp (mkTyCon "ThreadId") [] -- TODO: update with correct FQN when I move the datatype
+    typeOf _ = mkTyConApp (mkTyCon "Control.Monad.RTS.ThreadId") []
 
 newThreadId :: Nat -> ST s (ThreadId s r)
 newThreadId tid = fmap (ThreadId tid) $ newSTRef emptyQueue
@@ -398,6 +398,11 @@ data MVar s r a = MVar {
     mvar_putters :: STQ.STQueue s (STQ.Location s (Suspended s r), a, Resumable s r),
     mvar_takers  :: STQ.STQueue s (STQ.Location s (Suspended s r), a -> Resumable s r)
   }
+
+deriving instance Eq (MVar s r a)
+
+instance Typeable1 (MVar s r) where
+    typeOf1 _ = mkTyConApp (mkTyCon "Control.Monad.RTS.MVar") []
 
 newEmptyMVar :: RTS s r (MVar s r a)
 newEmptyMVar = newMVarInternal Nothing
