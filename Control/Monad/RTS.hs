@@ -192,16 +192,14 @@ instance Eq a => Monoid (SetEq a) where
     mappend = unionSetEq
 
 
--- | Both blocked and unblocked threads are suspended.
---
--- Suspended threads have an unwinder so they may take delivery of any asynchronous exception.
-type Suspended s r = (ThreadId s r, Unwinder s r)
+-- | Both blocked and unblocked threads have some information in common.
+type Thread s r = (ThreadId s r, Unwinder s r)
 
 -- | Unblocked threads are those that are available for immediate execution. There is no immediate
 -- problem preventing them from making progress.
 --
 -- These threads will either take delivery of an asynchronous exception or continue normally when rescheduled.
-type Unblocked s r = (Suspended s r, Pending s r)
+type Unblocked s r = (Thread s r, Pending s r)
 
 -- | Blocked threads are those that cannot currently be executed because they are waiting for another
 -- thread to get back to them. In this case, the corresponding 'Pending' action is stored in the corresponding
@@ -209,22 +207,21 @@ type Unblocked s r = (Suspended s r, Pending s r)
 --
 -- These threads will either take delivery of an asynchronous exception or continue normally after both the
 -- other thread has got back to them and they get rescheduled.
-type Blocked s r = Suspended s r
+type Blocked s r = Thread s r
 
 -- | A pending coroutine
 --
 -- You almost always want to use (scheduleM ((tid, throw, k) : unblockeds)) rather than (unPending k unblockeds) because
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
-newtype Pending s r = Pending { unPending :: [Unblocked s r]        -- ^ Runnable threads that are eligible for execution, and their multi-step unwinders. Everything in this list is Uninterruptible.
-                                          -> Nat                    -- ^ Next ThreadId to allocate
-                                          -> Scheduler              -- ^ Current scheduler, used for at the next rescheduling point
+newtype Pending s r = Pending { unPending :: [Unblocked s r]   -- ^ Runnable threads that are eligible for execution, and their multi-step unwinders. Everything in this list is Uninterruptible.
+                                          -> Nat               -- ^ Next ThreadId to allocate
+                                          -> Scheduler         -- ^ Current scheduler, used for at the next rescheduling point
                                           -> ST s (Result r) } -- TODO: Pending is itself almost a monad
-newtype RTS s r a = RTS { unRTS :: (a -> Pending s r)            -- ^ Continuation: how we should continue after we have our result
-                                -> ThreadId s r                  -- ^ ThreadId of this thread of execution
+newtype RTS s r a = RTS { unRTS :: (a -> Pending s r)          -- ^ Continuation: how we should continue after we have our result
                                 -> STQ.STQueue s (Blocked s r) -- ^ Blocked threads that may or may not have been resumed yet: this is necessary because we may want to deliver asyncronous exceptions to them. As such, everything in this list is Interruptible.
-                                -- -> SetEq (SyncObject s r)        -- ^ Overapproximation of the synchronisation objects this thread closes over
-                                -> Unwinder s r                  -- ^ Exception handling continuation
+                                -- -> SetEq (SyncObject s r)      -- ^ Overapproximation of the synchronisation objects this thread closes over
+                                -> Thread s r
                                 -> Pending s r }
 -- | We have to be able to throw several exceptions in succession because we can have more than one pending asynchronous exceptions.
 data Unwinder s r = Unwinder {
@@ -255,7 +252,7 @@ runRTS :: Scheduler -> (forall s. RTS s r r) -> Result r
 runRTS scheduler mx = runST $ do
     tid <- newThreadId 0
     blockeds <- STQ.new
-    unPending (unRTS mx (\x -> Pending $ \_unblockeds _next_tid _scheduler -> return (Success x)) tid blockeds (unhandledException E.Unmasked)) [] 1 scheduler
+    unPending (unRTS mx (\x -> Pending $ \_unblockeds _next_tid _scheduler -> return (Success x)) blockeds (tid, unhandledException E.Unmasked)) [] 1 scheduler
 
 unhandledException :: E.MaskingState -> Unwinder s r
 unhandledException masking = Unwinder {
@@ -272,8 +269,8 @@ instance Applicative (RTS s r) where
    (<*>) = ap
 
 instance Monad (RTS s r) where
-    return x = RTS $ \k _tid _blockeds _throw -> k x
-    mx >>= fxmy = RTS $ \k_y tid blockeds throw -> unRTS mx (\x -> unRTS (fxmy x) k_y tid blockeds throw) tid blockeds throw
+    return x = RTS $ \k _blockeds _thread -> k x
+    mx >>= fxmy = RTS $ \k_y blockeds thread -> unRTS mx (\x -> unRTS (fxmy x) k_y blockeds thread) blockeds thread
 
 instance MC.MonadException (RTS s r) where
     mask = mask
@@ -301,20 +298,20 @@ uninterruptibleMask :: ((forall a. RTS s r a -> RTS s r a) -> RTS s r b) -> RTS 
 uninterruptibleMask = maskWith Uninterruptible
 
 getMaskingState :: RTS s r E.MaskingState
-getMaskingState = RTS $ \k _tid _blockeds throw -> k (masking throw)
+getMaskingState = RTS $ \k _blockeds (_tid, throw) -> k (masking throw)
 
 maskWith :: Interruptibility -> ((forall a. RTS s r a -> RTS s r a) -> RTS s r b) -> RTS s r b
-maskWith interruptible while = RTS $ \k tid blockeds throw -> unRTS (while (\unmask -> RTS $ \k' tid' blockeds' throw' -> unRTS unmask k' tid' blockeds' throw' { masking = masking throw })) (\b -> Pending $ \unblockeds next_tid scheduler -> scheduleM blockeds (((tid, throw), k b) : unblockeds) next_tid scheduler) tid blockeds (throw `maskUnwinder` interruptible)
+maskWith interruptible while = RTS $ \k blockeds (tid, throw) -> unRTS (while (\unmask -> RTS $ \k' blockeds' (tid', throw') -> unRTS unmask k' blockeds' (tid', throw' { masking = masking throw }))) (\b -> Pending $ \unblockeds next_tid scheduler -> scheduleM blockeds (((tid, throw), k b) : unblockeds) next_tid scheduler) blockeds (tid, throw `maskUnwinder` interruptible)
   where
     -- NB: must call scheduleM after exiting the masked region so we can pump asynchronous exceptions that may have accrued while masked
     -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump which are *newly enabled*
     -- by the transition in masking states: this would help reduce the scheduler search space
 
 throwIO :: E.Exception e => e -> RTS s r a
-throwIO e = RTS $ \_k _tid _blockeds throw -> unwindSync throw (E.SomeException e)
+throwIO e = RTS $ \_k _blockeds (_tid, throw) -> unwindSync throw (E.SomeException e)
 
 throwTo :: E.Exception e => ThreadId s r -> e -> RTS s r ()
-throwTo target_tid e = RTS $ \k tid blockeds throw -> if target_tid == tid
+throwTo target_tid e = RTS $ \k blockeds (tid, throw) -> if target_tid == tid
                                                          then unwindSync throw (E.SomeException e) -- See GHC #4888: we always throw an exception regardless of the mask mode
                                                          else Pending $ \unblockeds next_tid scheduler -> do
                                                            -- If we ourselves get interrupted by an asynchronous exception before the one we sent was delivered,
@@ -326,7 +323,7 @@ throwTo target_tid e = RTS $ \k tid blockeds throw -> if target_tid == tid
                                                            scheduleM blockeds unblockeds next_tid scheduler
 
 catch :: E.Exception e => RTS s r a -> (e -> RTS s r a) -> RTS s r a
-catch mx handle = RTS $ \k tid blockeds throw -> unRTS mx k tid blockeds $ throw { uncheckedUnwind = \e -> maybe (uncheckedUnwind throw e) (\e -> return (Uninterruptible, throw, unRTS (handle e) k tid blockeds throw)) (E.fromException e) }
+catch mx handle = RTS $ \k blockeds (tid, throw) -> unRTS mx k blockeds (tid, throw { uncheckedUnwind = \e -> maybe (uncheckedUnwind throw e) (\e -> return (Uninterruptible, throw, unRTS (handle e) k blockeds (tid, throw))) (E.fromException e) })
 
 -- | Give up control to the scheduler. Control is automatically given up to the scheduler after calling every RTS primitive
 -- which might have effects observable outside the current thread. This is enough to almost guarantee that there exists some
@@ -336,7 +333,7 @@ catch mx handle = RTS $ \k tid blockeds throw -> unRTS mx k tid blockeds $ throw
 -- does not call any RTS primitive that gives up control to the scheduler. For such computations, you need to manually add a
 -- call to 'yield' to allow the scheduler to interrupt the loop.
 yield :: RTS s r ()
-yield = RTS $ \k tid blockeds throw -> Pending $ \unblockeds -> scheduleM blockeds (((tid, throw), k ()) : unblockeds)
+yield = RTS $ \k blockeds thread -> Pending $ \unblockeds -> scheduleM blockeds ((thread, k ()) : unblockeds)
   -- It is certainly enough to yield on every bind operation. But this is too much (and it breaks the monad laws).
   -- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
   -- operation and get the same results.
@@ -389,7 +386,7 @@ tell m = WriterST $ return ((), m)
 
 instance MonadST (RTS s r) where
     type StateThread (RTS s r) = s
-    liftST st = RTS $ \k _tid _blockeds _throw -> Pending $ \unblockeds next_tid scheduler -> st >>= \x -> unPending (k x) unblockeds next_tid scheduler
+    liftST st = RTS $ \k _blockeds _thread -> Pending $ \unblockeds next_tid scheduler -> st >>= \x -> unPending (k x) unblockeds next_tid scheduler
         
 canThrow :: E.MaskingState -> Interruptibility -> Bool
 canThrow E.Unmasked            _             = True
@@ -460,10 +457,13 @@ dequeueAsyncException (ThreadId _ ref) = do
 
 
 forkIO :: RTS s r () -> RTS s r (MC.ThreadId (RTS s r))
-forkIO forkable = RTS $ \k tid blockeds throw -> Pending $ \unblockeds next_tid scheduler -> newThreadId next_tid >>= \tid' -> scheduleM blockeds (((tid, throw), k tid') : ((tid', unhandledException (masking throw)), unRTS forkable (\() -> Pending (scheduleM blockeds)) tid' blockeds (unhandledException (masking throw))) : unblockeds) (next_tid + 1) scheduler
+forkIO forkable = RTS $ \k blockeds thread@(_, Unwinder { masking = masking }) -> Pending $ \unblockeds next_tid scheduler -> do
+    tid' <- newThreadId next_tid
+    let thread' = (tid', unhandledException masking)
+    scheduleM blockeds ((thread, k tid') : (thread', unRTS forkable (\() -> Pending (scheduleM blockeds)) blockeds thread') : unblockeds) (next_tid + 1) scheduler
 
 myThreadId :: RTS s r (MC.ThreadId (RTS s r))
-myThreadId = RTS $ \k tid _blockeds _throw -> k tid
+myThreadId = RTS $ \k _blockeds (tid, _throw) -> k tid
 
 
 -- TODO: I could detect more unreachable states if I find that a MVar currently blocking a Pending gets GCed
@@ -486,7 +486,7 @@ newMVar :: a -> RTS s r (MVar s r a)
 newMVar = newMVarInternal . Just
 
 newMVarInternal :: Maybe a -> RTS s r (MVar s r a)
-newMVarInternal mb_x = RTS $ \k _tid _blockeds _throw -> Pending $ \unblockeds next_tid scheduler -> do
+newMVarInternal mb_x = RTS $ \k _blockeds _thread -> Pending $ \unblockeds next_tid scheduler -> do
     data_ref <- newSTRef mb_x
     putter_queue <- STQ.new
     taker_queue <- STQ.new
@@ -494,7 +494,7 @@ newMVarInternal mb_x = RTS $ \k _tid _blockeds _throw -> Pending $ \unblockeds n
     unPending (k (MVar data_ref putter_queue taker_queue)) unblockeds next_tid scheduler
 
 takeMVar :: MVar s r a -> RTS s r a
-takeMVar mvar = RTS $ \k tid blockeds throw -> Pending $ \unblockeds next_tid scheduler -> do
+takeMVar mvar = RTS $ \k blockeds (tid, throw) -> Pending $ \unblockeds next_tid scheduler -> do
     dat <- readSTRef (mvar_data mvar)
     case dat of
        -- NB: we must guarantee that the woken thread doing a putMVar (if any) completes its operation since takeMVar has this guarantee
@@ -512,7 +512,7 @@ takeMVar mvar = RTS $ \k tid blockeds throw -> Pending $ \unblockeds next_tid sc
           scheduleM blockeds unblockeds next_tid scheduler
 
 putMVar :: MVar s r a -> a -> RTS s r ()
-putMVar mvar x = RTS $ \k tid blockeds throw -> Pending $ \unblockeds next_tid scheduler -> do
+putMVar mvar x = RTS $ \k blockeds (tid, throw) -> Pending $ \unblockeds next_tid scheduler -> do
     dat <- readSTRef (mvar_data mvar)
     case dat of
        -- NB: we must guarantee that the woken thread doing a takeMVar (if any) completes its operation since putMVar has this guarantee
