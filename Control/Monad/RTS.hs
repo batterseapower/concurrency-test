@@ -544,7 +544,7 @@ takeMVar mvar = RTS $ \k blockeds (tid, syncobjs, throw) -> Pending $ \unblocked
               success_loc <- STQ.enqueue interrupt_act (mvar_takers mvar)
               -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
               interrupt_loc <- flip STQ.enqueue blockeds (tid, syncobjs, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
-              return $ \(syncobjs', x) -> STQ.delete interrupt_loc >>= \(Just _) -> let syncobjs'' = syncobjs `mappend` syncobjs' in return ((tid, syncobjs'', throw), k (syncobjs'', x))
+              return $ \(syncobjs', x) -> STQ.delete interrupt_loc >>= \(Just _) -> return ((tid, syncobjs, throw), k (syncobjs `mappend` syncobjs', x))
           scheduleM blockeds unblockeds next_tid scheduler
 
 putMVar :: MVar s r a -> a -> RTS s r ()
