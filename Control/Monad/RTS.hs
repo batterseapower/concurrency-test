@@ -217,6 +217,11 @@ data Unwinder s r = Unwinder {
                              Pending s r)
   }
 
+maskUnwinder :: Unwinder s r -> Interruptibility -> Unwinder s r
+maskUnwinder throw Interruptible   = throw { masking = case masking throw of E.MaskedUninterruptible -> E.MaskedUninterruptible; _ -> E.MaskedInterruptible }
+maskUnwinder throw Uninterruptible = throw { masking = E.MaskedUninterruptible }
+
+
 unwindAsync :: Unwinder s r -> Interruptibility -> Maybe (E.SomeException -> ST s (Interruptibility, Unwinder s r, Pending s r))
 unwindAsync throw interruptible = guard (canThrow (masking throw) interruptible) >> return (uncheckedUnwind throw)
 
@@ -278,13 +283,11 @@ getMaskingState :: RTS s r E.MaskingState
 getMaskingState = RTS $ \k _tid _suspendeds throw -> k (masking throw)
 
 maskWith :: Interruptibility -> ((forall a. RTS s r a -> RTS s r a) -> RTS s r b) -> RTS s r b
-maskWith interruptible while = RTS $ \k tid suspendeds throw -> unRTS (while (\unmask -> RTS $ \k' tid' suspendeds' throw' -> unRTS unmask k' tid' suspendeds' throw' { masking = masking throw })) (\b -> Pending $ \resumables next_tid scheduler -> scheduleM suspendeds ((tid, throw, k b) : resumables) next_tid scheduler) tid suspendeds (throw { masking = masking' })
+maskWith interruptible while = RTS $ \k tid suspendeds throw -> unRTS (while (\unmask -> RTS $ \k' tid' suspendeds' throw' -> unRTS unmask k' tid' suspendeds' throw' { masking = masking throw })) (\b -> Pending $ \resumables next_tid scheduler -> scheduleM suspendeds ((tid, throw, k b) : resumables) next_tid scheduler) tid suspendeds (throw `maskUnwinder` interruptible)
   where
     -- NB: must call scheduleM after exiting the masked region so we can pump asynchronous exceptions that may have accrued while masked
     -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump which are *newly enabled*
     -- by the transition in masking states: this would help reduce the scheduler search space
-    masking' = case interruptible of Uninterruptible -> E.MaskedUninterruptible
-                                     Interruptible   -> E.MaskedInterruptible -- FIXME: shouldn't this be E.MaskedUninterruptible if masking is?
 
 throwIO :: E.Exception e => e -> RTS s r a
 throwIO e = RTS $ \_k _tid _suspendeds throw -> unwindSync throw (E.SomeException e)
