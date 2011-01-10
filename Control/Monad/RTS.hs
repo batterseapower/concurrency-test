@@ -255,14 +255,19 @@ throwTo target_tid e = RTS $ \k tid masking suspendeds throw -> if target_tid ==
 catch :: E.Exception e => RTS s r a -> (e -> RTS s r a) -> RTS s r a
 catch mx handle = RTS $ \k tid masking suspendeds throw -> unRTS mx k tid masking suspendeds $ Unwinder $ \e -> maybe (unwind throw e) (\e -> (masking, Uninterruptible, throw, unRTS (handle e) k tid masking suspendeds throw)) (E.fromException e)
 
--- | Give up control to the scheduler: yields should be used at every point where it is useful to allow QuickCheck
--- to try several different scheduling options.
+-- | Give up control to the scheduler. Control is automatically given up to the scheduler after calling every RTS primitive
+-- which might have effects observable outside the current thread. This is enough to almost guarantee that there exists some
+-- scheduler for which the RTS monad will give the same results as the IO monad.
 --
--- It is certainly enough to yield on every bind operation. But this is too much (and it breaks the monad laws).
--- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
--- operation and get the same results.
+-- The exception to this guarantee is if you write a non-terminating computation on a thread (other than the initial thread) which
+-- does not call any RTS primitive that gives up control to the scheduler. For such computations, you need to manually add a
+-- call to 'yield' to allow the scheduler to interrupt the loop.
 yield :: RTS s r ()
 yield = RTS $ \k tid masking suspendeds throw -> Pending $ \resumables -> scheduleM suspendeds ((tid, masking, throw, k ()) : resumables)
+  -- It is certainly enough to yield on every bind operation. But this is too much (and it breaks the monad laws).
+  -- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
+  -- operation and get the same results.
+
 
 -- TODO: rethink treatment of asynchronous exceptions.. for one thing we are not generating enough schedulings
 -- TODO: it might be cool to have a mode that generates random asynchronous exceptions to try to crash other threads
