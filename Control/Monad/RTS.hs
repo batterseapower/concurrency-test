@@ -3,6 +3,7 @@
 module Control.Monad.RTS where
 
 import Control.Applicative (Applicative(..))
+import Control.Arrow ((***))
 import qualified Control.Exception as E
 import Control.Monad
 import qualified Control.Monad.Concurrent as MC
@@ -487,8 +488,8 @@ myThreadId = RTS $ \k _blockeds (tid, _throw) -> k tid
 data MVar s r a = MVar {
     mvar_data :: STRef s (Maybe a),
     -- MVars have guaranteed FIFO semantics, hence the queues
-    mvar_putters :: STQ.STQueue s (STQ.Location s (Blocked s r), a, Unblocked s r),
-    mvar_takers  :: STQ.STQueue s (STQ.Location s (Blocked s r), a -> Unblocked s r)
+    mvar_putters :: STQ.STQueue s (ST s (a, Unblocked s r)),
+    mvar_takers  :: STQ.STQueue s (a -> ST s (Unblocked s r))
   }
 
 deriving instance Eq (MVar s r a)
@@ -519,15 +520,16 @@ takeMVar mvar = RTS $ \k blockeds (tid, throw) -> Pending $ \unblockeds next_tid
        -- NB: we must guarantee that the woken thread doing a putMVar (if any) completes its operation since takeMVar has this guarantee
       Just x  -> do
           (dat', unblockeds') <- STQ.dequeue (mvar_putters mvar) >>= \it -> case it of
-              Nothing                         -> return (Nothing, unblockeds)
-              Just (interrupt_loc, x, putter) -> STQ.delete interrupt_loc >>= \(Just _) -> return (Just x, putter : unblockeds)
+              Nothing            -> return (Nothing, unblockeds)
+              Just interrupt_act -> fmap (Just *** (: unblockeds)) interrupt_act
           writeSTRef (mvar_data mvar) dat'
           scheduleM blockeds (((tid, throw), k x) : unblockeds') next_tid scheduler
       Nothing -> do
-          _ <- mfix $ \interrupt_loc -> do
-              success_loc <- STQ.enqueue (interrupt_loc, \x -> ((tid, throw), k x)) (mvar_takers mvar)
+          _ <- mfix $ \interrupt_act -> do
+              success_loc <- STQ.enqueue interrupt_act (mvar_takers mvar)
               -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
-              flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
+              interrupt_loc <- flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
+              return $ \x -> STQ.delete interrupt_loc >>= \(Just _) -> return ((tid, throw), k x)
           scheduleM blockeds unblockeds next_tid scheduler
 
 putMVar :: MVar s r a -> a -> RTS s r ()
@@ -537,15 +539,16 @@ putMVar mvar x = RTS $ \k blockeds (tid, throw) -> Pending $ \unblockeds next_ti
        -- NB: we must guarantee that the woken thread doing a takeMVar (if any) completes its operation since putMVar has this guarantee
       Nothing -> do
           (dat', unblockeds') <- STQ.dequeue (mvar_takers mvar) >>= \it -> case it of
-              Nothing                            -> return (Just x, unblockeds)
-              Just (interrupt_loc, mk_resumable) -> STQ.delete interrupt_loc >>= \(Just _) -> return (Nothing, mk_resumable x : unblockeds)
+              Nothing            -> return (Just x, unblockeds)
+              Just interrupt_act -> fmap (((,) Nothing) . (: unblockeds)) (interrupt_act x)
           writeSTRef (mvar_data mvar) dat'
           scheduleM blockeds (((tid, throw), k ()) : unblockeds') next_tid scheduler
       Just x  -> do
-          _ <- mfix $ \interrupt_loc -> do
-              success_loc <- STQ.enqueue (interrupt_loc, x, ((tid, throw), k ())) (mvar_putters mvar)
+          _ <- mfix $ \interrupt_act -> do
+              success_loc <- STQ.enqueue interrupt_act (mvar_putters mvar)
               -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
-              flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
+              interrupt_loc <- flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
+              return $ STQ.delete interrupt_loc >>= \(Just _) -> return (x, ((tid, throw), k ()))
           scheduleM blockeds unblockeds next_tid scheduler
 
 
