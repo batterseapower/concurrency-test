@@ -271,8 +271,8 @@ maskUnwinder throw Interruptible   = throw { masking = case masking throw of E.M
 maskUnwinder throw Uninterruptible = throw { masking = E.MaskedUninterruptible }
 
 
-unwindAsync :: Thread s r -> Interruptibility -> Maybe (E.SomeException -> ST s (Unblocked s r))
-unwindAsync (tid, syncobjs, throw) interruptible = guard (canThrow (masking throw) interruptible) >> return (fmap ($ tid) . uncheckedUnwind throw . ((,) syncobjs))
+unwindAsync :: Thread s r -> Interruptibility -> Maybe (Closure s r E.SomeException -> ST s (Unblocked s r))
+unwindAsync (tid, _syncobjs, throw) interruptible = guard (canThrow (masking throw) interruptible) >> return (fmap ($ tid) . uncheckedUnwind throw)
 
 unwindSync :: Thread s r -> E.SomeException -> Pending s r
 unwindSync (tid, syncobjs, throw) e = join $ liftST $ fmap (snd . ($ tid)) (uncheckedUnwind throw (syncobjs, e))
@@ -349,7 +349,7 @@ throwTo target_tid e = RTS $ \k blockeds (tid, syncobjs, throw) -> case target_t
       -- If we ourselves get interrupted by an asynchronous exception before the one we sent was delivered,
       -- recover by still delivering the exception but ensure that doing so does not cause the pending list to change
       _ <- liftST $ mfix $ \kill_interruptable -> do
-        kill_blocked <- enqueueAsyncException target_tid (E.SomeException e) ((tid, syncobjs, throw), k (syncobjs, ())) kill_interruptable
+        kill_blocked <- enqueueAsyncException target_tid (syncobjs, E.SomeException e) ((tid, syncobjs, throw), k (syncobjs, ())) kill_interruptable
         blocked_loc <- flip STQ.enqueue blockeds (tid, syncobjs, throw { uncheckedUnwind = \e -> kill_blocked >> uncheckedUnwind throw e })
         return $ STQ.delete blocked_loc >>= \(Just _) -> return ()
       Pending (scheduleM blockeds)
@@ -456,7 +456,7 @@ dequeueAsyncExceptionsOnBlocked thread@(tid, _, _) = do
              (pending, unblockeds) <- unchecked_unwind e >>= dequeueAsyncExceptions
              return $ Just $ (thread, pending) : maybe id (:) mb_resumable unblockeds
 
-data ThreadId s r = ThreadId Nat (STRef s (Queue (E.SomeException, STRef s (Maybe (ST s (Unblocked s r))))))
+data ThreadId s r = ThreadId Nat (STRef s (Queue (Closure s r E.SomeException, STRef s (Maybe (ST s (Unblocked s r))))))
 
 instance Eq (ThreadId s r) where
     ThreadId n1 _ == ThreadId n2 _ = n1 == n2
@@ -473,14 +473,14 @@ instance Typeable (ThreadId s r) where
 newThreadId :: Nat -> ST s (ThreadId s r)
 newThreadId tid = fmap (ThreadId tid) $ newSTRef emptyQueue
 
-enqueueAsyncException :: ThreadId s r -> E.SomeException -> Unblocked s r -> ST s () -> ST s (ST s ())
+enqueueAsyncException :: ThreadId s r -> Closure s r E.SomeException -> Unblocked s r -> ST s () -> ST s (ST s ())
 enqueueAsyncException (ThreadId _ ref) e resumable notify_block_complete = do
     asyncs <- readSTRef ref
     resumable_ref <- newSTRef $ Just $ notify_block_complete >> return resumable
     writeSTRef ref (queue (e, resumable_ref) asyncs)
     return $ readSTRef resumable_ref >>= \(Just _) -> writeSTRef resumable_ref Nothing
 
-dequeueAsyncException :: ThreadId s r -> ST s (Maybe (E.SomeException, Maybe (Unblocked s r)))
+dequeueAsyncException :: ThreadId s r -> ST s (Maybe (Closure s r E.SomeException, Maybe (Unblocked s r)))
 dequeueAsyncException (ThreadId _ ref) = do
     asyncs <- readSTRef ref
     case dequeue asyncs of
