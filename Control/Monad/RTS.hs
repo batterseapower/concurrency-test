@@ -36,6 +36,11 @@ instance Arbitrary StdGen where
     shrink _ = []
 
 
+-- I was initially inspired by Quviq/PULSE <http://www.protest-project.eu/upload/paper/icfp070-claessen.pdf>.
+-- However the approach that I'm taking here is much more similar to that of the CHESS system
+-- of Madanlal Musuvathi <http://research.microsoft.com/en-us/people/madanm/allpubs.aspx>
+
+
 -- I used to use unsafeIsEvaluated to decide where to put in "...", but that pruned too heavily because
 -- I couldn't show the schedule before it was actually poked on and those thunks turned into real values.
 {-# NOINLINE showsExplored #-}
