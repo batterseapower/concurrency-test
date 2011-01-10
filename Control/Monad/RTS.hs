@@ -210,7 +210,10 @@ newtype RTS s r a = RTS { unRTS :: (a -> Pending s r)            -- ^ Continuati
                                 -> Pending s r }
 -- | We have to be able to throw several exceptions in succession because we can have more than one pending asynchronous exceptions.
 data Unwinder s r = Unwinder {
-    masking         :: E.MaskingState, -- ^ Where we stand wrt. asynchronous exceptions
+    -- | Where we stand wrt. asynchronous exceptions: this is used to control whether we can actually unwind
+    masking         :: E.MaskingState,
+    -- | The ST action be used as a one-shot thing. For blocked threads, once you run the ST action (to deliver an asynchronous exception), the thread
+    -- will be dumped from the suspended position and enqueued as pending by the user of Suspended
     uncheckedUnwind :: E.SomeException
                     -> ST s (Interruptibility,
                              Unwinder s r,
@@ -406,7 +409,6 @@ dequeueAsyncExceptionsOnBlocked (tid, throw) = do
              (pending, resumables) <- unchecked_unwind e >>= dequeueAsyncExceptions tid
              return $ Just $ (tid, throw, pending) : maybe id (:) mb_resumable resumables
 
--- FIXME (comment) newtype Interrupter s r = Interrupter { interrupt :: ST s () } -- NB: must be used as a one-shot thing (once you grab the unwinder, the thread will be dumped from the suspended position and enqueued as pending by the user of Suspended)
 type Suspended s r = (ThreadId s r, Unwinder s r)
 
 data ThreadId s r = ThreadId Nat (STRef s (Queue (E.SomeException, STRef s (Maybe (ST s (Resumable s r))))))
