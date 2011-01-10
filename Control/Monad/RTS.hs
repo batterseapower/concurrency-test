@@ -1,11 +1,12 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DoRec, DeriveDataTypeable, StandaloneDeriving, ExistentialQuantification #-}
+{-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DeriveDataTypeable, StandaloneDeriving, ExistentialQuantification #-}
 module Control.Monad.RTS where
 
 import Control.Applicative (Applicative(..))
 import qualified Control.Exception as E
 import Control.Monad
 import qualified Control.Monad.Concurrent as MC
+import Control.Monad.Fix
 import Control.Monad.ST
 import Control.Monad.ST.Class
 
@@ -230,8 +231,12 @@ instance Applicative (Pending' s r) where
     (<*>) = ap
 
 instance Monad (Pending' s r) where
-    return x = Pending $ \_unblockeds _next_tid _scheduler -> return x
+    return x = liftST (return x)
     mx >>= fxmy = Pending $ \unblockeds next_tid scheduler -> unPending mx unblockeds next_tid scheduler >>= \x -> unPending (fxmy x) unblockeds next_tid scheduler
+
+instance MonadST (Pending' s r) where
+    type StateThread (Pending' s r) = s
+    liftST st = Pending $ \_unblockeds _next_tid _scheduler -> st
 
 
 newtype RTS s r a = RTS { unRTS :: (a -> Pending s r)          -- ^ Continuation: how we should continue after we have our result
@@ -260,20 +265,18 @@ unwindAsync :: Unwinder s r -> Interruptibility -> Maybe (E.SomeException -> ST 
 unwindAsync throw interruptible = guard (canThrow (masking throw) interruptible) >> return (uncheckedUnwind throw)
 
 unwindSync :: Unwinder s r -> E.SomeException -> Pending s r
-unwindSync throw e = Pending $ \unblockeds next_tid scheduler -> do
-    pending <- fmap thd3 (uncheckedUnwind throw e)
-    unPending pending unblockeds next_tid scheduler
+unwindSync throw e = join $ liftST $ fmap thd3 (uncheckedUnwind throw e)
 
 runRTS :: Scheduler -> (forall s. RTS s r r) -> Result r
 runRTS scheduler mx = runST $ do
     tid <- newThreadId 0
     blockeds <- STQ.new
-    unPending (unRTS mx (\x -> Pending $ \_unblockeds _next_tid _scheduler -> return (Success x)) blockeds (tid, unhandledException E.Unmasked)) [] 1 scheduler
+    unPending (unRTS mx (\x -> return (Success x)) blockeds (tid, unhandledException E.Unmasked)) [] 1 scheduler
 
 unhandledException :: E.MaskingState -> Unwinder s r
 unhandledException masking = Unwinder {
     masking = masking,
-    uncheckedUnwind = \e -> return (Uninterruptible {- Don't think it matters either way -}, unhandledException (E.Unmasked), Pending $ \_unblockeds _next_tid _scheduler -> return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
+    uncheckedUnwind = \e -> return (Uninterruptible {- Don't think it matters either way -}, unhandledException (E.Unmasked), return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
   }
 
 
@@ -329,14 +332,14 @@ throwIO e = RTS $ \_k _blockeds (_tid, throw) -> unwindSync throw (E.SomeExcepti
 throwTo :: E.Exception e => ThreadId s r -> e -> RTS s r ()
 throwTo target_tid e = RTS $ \k blockeds (tid, throw) -> if target_tid == tid
                                                          then unwindSync throw (E.SomeException e) -- See GHC #4888: we always throw an exception regardless of the mask mode
-                                                         else Pending $ \unblockeds next_tid scheduler -> do
+                                                         else do
                                                            -- If we ourselves get interrupted by an asynchronous exception before the one we sent was delivered,
                                                            -- recover by still delivering the exception but ensure that doing so does not cause the pending list to change
-                                                           rec { let kill_suspended = STQ.delete interrupt_loc >>= \(Just _) -> return ()
-                                                               ; kill_blocked <- enqueueAsyncException target_tid (E.SomeException e) ((tid, throw), k ()) kill_suspended
-                                                               ; interrupt_loc <- flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> kill_blocked >> uncheckedUnwind throw e })
-                                                               ; return () }
-                                                           scheduleM blockeds unblockeds next_tid scheduler
+                                                           _ <- liftST $ mfix $ \interrupt_loc -> do
+                                                             let kill_suspended = STQ.delete interrupt_loc >>= \(Just _) -> return ()
+                                                             kill_blocked <- enqueueAsyncException target_tid (E.SomeException e) ((tid, throw), k ()) kill_suspended
+                                                             flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> kill_blocked >> uncheckedUnwind throw e })
+                                                           Pending (scheduleM blockeds)
 
 catch :: E.Exception e => RTS s r a -> (e -> RTS s r a) -> RTS s r a
 catch mx handle = RTS $ \k blockeds (tid, throw) -> unRTS mx k blockeds (tid, throw { uncheckedUnwind = \e -> maybe (uncheckedUnwind throw e) (\e -> return (Uninterruptible, throw, unRTS (handle e) k blockeds (tid, throw))) (E.fromException e) })
@@ -502,12 +505,14 @@ newMVar :: a -> RTS s r (MVar s r a)
 newMVar = newMVarInternal . Just
 
 newMVarInternal :: Maybe a -> RTS s r (MVar s r a)
-newMVarInternal mb_x = RTS $ \k _blockeds _thread -> Pending $ \unblockeds next_tid scheduler -> do
-    data_ref <- newSTRef mb_x
-    putter_queue <- STQ.new
-    taker_queue <- STQ.new
+newMVarInternal mb_x = RTS $ \k _blockeds _thread -> do
+    mvar <- liftST $ do
+        data_ref <- newSTRef mb_x
+        putter_queue <- STQ.new
+        taker_queue <- STQ.new
+        return (MVar data_ref putter_queue taker_queue)
     -- NB: unPending legitimate here because newMVarInternal cannot have externally visible side effects
-    unPending (k (MVar data_ref putter_queue taker_queue)) unblockeds next_tid scheduler
+    k mvar
 
 takeMVar :: MVar s r a -> RTS s r a
 takeMVar mvar = RTS $ \k blockeds (tid, throw) -> Pending $ \unblockeds next_tid scheduler -> do
@@ -521,10 +526,10 @@ takeMVar mvar = RTS $ \k blockeds (tid, throw) -> Pending $ \unblockeds next_tid
           writeSTRef (mvar_data mvar) dat'
           scheduleM blockeds (((tid, throw), k x) : unblockeds') next_tid scheduler
       Nothing -> do
-          rec { success_loc <- STQ.enqueue (interrupt_loc, \x -> ((tid, throw), k x)) (mvar_takers mvar)
-                -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
-              ; interrupt_loc <- flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
-              ; return () }
+          _ <- mfix $ \interrupt_loc -> do
+              success_loc <- STQ.enqueue (interrupt_loc, \x -> ((tid, throw), k x)) (mvar_takers mvar)
+              -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
+              flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
           scheduleM blockeds unblockeds next_tid scheduler
 
 putMVar :: MVar s r a -> a -> RTS s r ()
@@ -539,10 +544,10 @@ putMVar mvar x = RTS $ \k blockeds (tid, throw) -> Pending $ \unblockeds next_ti
           writeSTRef (mvar_data mvar) dat'
           scheduleM blockeds (((tid, throw), k ()) : unblockeds') next_tid scheduler
       Just x  -> do
-          rec { success_loc <- STQ.enqueue (interrupt_loc, x, ((tid, throw), k ())) (mvar_putters mvar)
-                -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
-              ; interrupt_loc <- flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
-              ; return () }
+          _ <- mfix $ \interrupt_loc -> do
+              success_loc <- STQ.enqueue (interrupt_loc, x, ((tid, throw), k ())) (mvar_putters mvar)
+              -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
+              flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
           scheduleM blockeds unblockeds next_tid scheduler
 
 
