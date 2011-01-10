@@ -268,7 +268,7 @@ maskWith interruptible while = RTS $ \k tid masking suspendeds throw -> unRTS (w
     -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump which are *newly enabled*
     -- by the transition in masking states: this would help reduce the scheduler search space
     masking' = case interruptible of Uninterruptible -> E.MaskedUninterruptible
-                                     Interruptible   -> E.MaskedInterruptible
+                                     Interruptible   -> E.MaskedInterruptible -- FIXME: shouldn't this be E.MaskedUninterruptible if masking is?
 
 throwIO :: E.Exception e => e -> RTS s r a
 throwIO e = RTS $ \_k _tid _masking _suspendeds throw -> fth4 (unwind throw (E.SomeException e))
