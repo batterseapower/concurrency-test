@@ -289,7 +289,7 @@ instance Functor (RTS s r) where
 
 instance Applicative (RTS s r) where
    pure = return
-   (<*>) = ap
+   (<*>) = ap -- TODO: we could be more precise about how syncobjs flows for an Applicative computation
 
 instance Monad (RTS s r) where
     return x = RTS $ \k _blockeds _thread -> k x
