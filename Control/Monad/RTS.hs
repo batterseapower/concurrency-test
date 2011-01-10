@@ -214,10 +214,26 @@ type Blocked s r = Thread s r
 -- You almost always want to use (scheduleM ((tid, throw, k) : unblockeds)) rather than (unPending k unblockeds) because
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
-newtype Pending s r = Pending { unPending :: [Unblocked s r]   -- ^ Runnable threads that are eligible for execution, and their multi-step unwinders. Everything in this list is Uninterruptible.
-                                          -> Nat               -- ^ Next ThreadId to allocate
-                                          -> Scheduler         -- ^ Current scheduler, used for at the next rescheduling point
-                                          -> ST s (Result r) } -- TODO: Pending is itself almost a monad
+type Pending s r = Pending' s r (Result r)
+
+-- | Generalised pending corountine (a reader monad)
+newtype Pending' s r a = Pending { unPending :: [Unblocked s r]   -- ^ Runnable threads that are eligible for execution, and their multi-step unwinders. Everything in this list is Uninterruptible.
+                                             -> Nat               -- ^ Next ThreadId to allocate
+                                             -> Scheduler         -- ^ Current scheduler, used for at the next rescheduling point
+                                             -> ST s a }
+
+instance Functor (Pending' s r) where
+    fmap = liftM
+
+instance Applicative (Pending' s r) where
+    pure = return
+    (<*>) = ap
+
+instance Monad (Pending' s r) where
+    return x = Pending $ \_unblockeds _next_tid _scheduler -> return x
+    mx >>= fxmy = Pending $ \unblockeds next_tid scheduler -> unPending mx unblockeds next_tid scheduler >>= \x -> unPending (fxmy x) unblockeds next_tid scheduler
+
+
 newtype RTS s r a = RTS { unRTS :: (a -> Pending s r)          -- ^ Continuation: how we should continue after we have our result
                                 -> STQ.STQueue s (Blocked s r) -- ^ Blocked threads that may or may not have been resumed yet: this is necessary because we may want to deliver asyncronous exceptions to them. As such, everything in this list is Interruptible.
                                 -- -> SetEq (SyncObject s r)      -- ^ Overapproximation of the synchronisation objects this thread closes over
