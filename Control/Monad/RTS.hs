@@ -251,8 +251,7 @@ data Unwinder s r = Unwinder {
     -- | The ST action be used as a one-shot thing. For blocked threads, once you run the ST action (to deliver an asynchronous exception), the thread
     -- will be dumped from the suspended position and enqueued as pending by the user of Blocked
     uncheckedUnwind :: E.SomeException
-                    -> ST s (Interruptibility,
-                             Unwinder s r,
+                    -> ST s (Unwinder s r,
                              Pending s r)
   }
 
@@ -261,11 +260,11 @@ maskUnwinder throw Interruptible   = throw { masking = case masking throw of E.M
 maskUnwinder throw Uninterruptible = throw { masking = E.MaskedUninterruptible }
 
 
-unwindAsync :: Unwinder s r -> Interruptibility -> Maybe (E.SomeException -> ST s (Interruptibility, Unwinder s r, Pending s r))
+unwindAsync :: Unwinder s r -> Interruptibility -> Maybe (E.SomeException -> ST s (Unwinder s r, Pending s r))
 unwindAsync throw interruptible = guard (canThrow (masking throw) interruptible) >> return (uncheckedUnwind throw)
 
 unwindSync :: Unwinder s r -> E.SomeException -> Pending s r
-unwindSync throw e = join $ liftST $ fmap thd3 (uncheckedUnwind throw e)
+unwindSync throw e = join $ liftST $ fmap snd (uncheckedUnwind throw e)
 
 runRTS :: Scheduler -> (forall s. RTS s r r) -> Result r
 runRTS scheduler mx = runST $ do
@@ -276,7 +275,7 @@ runRTS scheduler mx = runST $ do
 unhandledException :: E.MaskingState -> Unwinder s r
 unhandledException masking = Unwinder {
     masking = masking,
-    uncheckedUnwind = \e -> return (Uninterruptible {- Don't think it matters either way -}, unhandledException (E.Unmasked), return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
+    uncheckedUnwind = \e -> return (unhandledException (E.Unmasked), return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
   }
 
 
@@ -342,7 +341,7 @@ throwTo target_tid e = RTS $ \k blockeds (tid, throw) -> if target_tid == tid
                                                            Pending (scheduleM blockeds)
 
 catch :: E.Exception e => RTS s r a -> (e -> RTS s r a) -> RTS s r a
-catch mx handle = RTS $ \k blockeds (tid, throw) -> unRTS mx k blockeds (tid, throw { uncheckedUnwind = \e -> maybe (uncheckedUnwind throw e) (\e -> return (Uninterruptible, throw, unRTS (handle e) k blockeds (tid, throw))) (E.fromException e) })
+catch mx handle = RTS $ \k blockeds (tid, throw) -> unRTS mx k blockeds (tid, throw { uncheckedUnwind = \e -> maybe (uncheckedUnwind throw e) (\e -> return (throw, unRTS (handle e) k blockeds (tid, throw))) (E.fromException e) })
 
 -- | Give up control to the scheduler. Control is automatically given up to the scheduler after calling every RTS primitive
 -- which might have effects observable outside the current thread. This is enough to almost guarantee that there exists some
@@ -373,7 +372,7 @@ scheduleM blockeds unblockeds next_tid scheduler = do
       [] -> return BlockedIndefinitely
       _  -> do
           -- Delivers asynchoronous exceptions to the chosen resumable ONLY
-          (pending, unblockeds'') <- dequeueAsyncExceptions tid (Uninterruptible, throw, pending)
+          (pending, unblockeds'') <- dequeueAsyncExceptions tid (throw, pending)
           unPending pending (unblockeds'' ++ unblockeds') next_tid scheduler'
         where (scheduler', i) = schedule scheduler (genericLength unblockeds - 1)
               (((tid, throw), pending), unblockeds') = genericDeleteAt unblockeds i
@@ -412,13 +411,13 @@ canThrow E.Unmasked            _             = True
 canThrow E.MaskedInterruptible Interruptible = True
 canThrow _                     _             = False
 
-dequeueAsyncExceptions :: ThreadId s r -> (Interruptibility, Unwinder s r, Pending s r) -> ST s (Pending s r, [Unblocked s r])
+dequeueAsyncExceptions :: ThreadId s r -> (Unwinder s r, Pending s r) -> ST s (Pending s r, [Unblocked s r])
 dequeueAsyncExceptions tid = go []
   where
     -- TODO: currently I always unwind absolutely every available exception.
     -- This might mask some bugs, so we might want to just unwind a (possibly empty) prefix.
-    go unblockeds (interruptibility, throw, pending) = do
-      case unwindAsync throw interruptibility of
+    go unblockeds (throw, pending) = do
+      case unwindAsync throw Uninterruptible of -- Uninterruptible because this Pending is always just suspended, not blocked!
          -- Cannot unwind this thread right now due to masking
         Nothing -> return (pending, unblockeds)
         Just unchecked_unwind -> do
