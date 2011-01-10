@@ -1,5 +1,5 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DoRec, DeriveDataTypeable, StandaloneDeriving #-}
+{-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DoRec, DeriveDataTypeable, StandaloneDeriving, ExistentialQuantification #-}
 module Control.Monad.RTS where
 
 import Control.Applicative (Applicative(..))
@@ -26,6 +26,8 @@ import Test.QuickCheck.Gen
 
 import System.Random
 import System.IO.Unsafe
+
+import Unsafe.Coerce (unsafeCoerce)
 
 import Utilities
 import Prelude hiding (catch)
@@ -165,22 +167,48 @@ instance Traversable Result where
     traverse _ (UnhandledException e) = pure (UnhandledException e)
 
 
+data SyncObject s r = forall a. SyncMVar     (MVar s r a)
+                    |           SyncThreadId (ThreadId s r)
+
+instance Eq (SyncObject s r) where
+    SyncMVar mvar1    == SyncMVar mvar2    = mvar1 == unsafeCoerce mvar2 -- Grr... nonetheless safe since (==) cannot look at the element (free theorem)
+    SyncThreadId tid1 == SyncThreadId tid2 = tid1 == tid2
+    _                 == _                 = False
+
+
+newtype SetEq a = SetEq { unSetEq :: [a] }
+
+instance Eq a => Eq (SetEq a) where
+    se1 == se2 = all (`elem` unSetEq se2) (unSetEq se1) -- This is correct because elements in both sets must be unique
+
+emptySetEq :: SetEq a
+emptySetEq = SetEq []
+
+unionSetEq :: Eq a => SetEq a -> SetEq a -> SetEq a
+unionSetEq se1 se2 = SetEq $ nub $ unSetEq se1 ++ unSetEq se2
+
+instance Eq a => Monoid (SetEq a) where
+    mempty = emptySetEq
+    mappend = unionSetEq
+
+
 -- | A pending coroutine
 --
 -- You almost always want to use (scheduleM ((tid, throw, k) : resumables)) rather than (unPending k resumables) because
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
 type Resumable s r = (ThreadId s r, E.MaskingState, Unwinder s r, Pending s r)
-newtype Pending s r = Pending { unPending :: [Resumable s r]   -- ^ Runnable threads that are eligible for execution, and their multi-step unwinders. Everything in this list is Uninterruptible.
-                                          -> Nat               -- ^ Next ThreadId to allocate
-                                          -> Scheduler         -- ^ Current scheduler, used for at the next rescheduling point
+newtype Pending s r = Pending { unPending :: [Resumable s r]        -- ^ Runnable threads that are eligible for execution, and their multi-step unwinders. Everything in this list is Uninterruptible.
+                                          -> Nat                    -- ^ Next ThreadId to allocate
+                                          -> Scheduler              -- ^ Current scheduler, used for at the next rescheduling point
                                           -> ST s (Result r) } -- TODO: Pending is itself almost a monad
 newtype RTS s r a = RTS { unRTS :: (a -> Pending s r)            -- ^ Continuation: how we should continue after we have our result
-                                   -> ThreadId s r                  -- ^ ThreadId of this thread of execution
-                                   -> E.MaskingState                -- ^ Where we stand wrt. asynchronous exceptions
-                                   -> STQ.STQueue s (Suspended s r) -- ^ Suspended threads that may or may not have been resumed yet: this is necessary because we may want to deliver asyncronous exceptions to them. As such, everything in this list is Interruptible.
-                                   -> Unwinder s r                  -- ^ Exception handling continuation
-                                   -> Pending s r }
+                                -> ThreadId s r                  -- ^ ThreadId of this thread of execution
+                                -> E.MaskingState                -- ^ Where we stand wrt. asynchronous exceptions
+                                -> STQ.STQueue s (Suspended s r) -- ^ Suspended threads that may or may not have been resumed yet: this is necessary because we may want to deliver asyncronous exceptions to them. As such, everything in this list is Interruptible.
+                                -- -> SetEq (SyncObject s r)        -- ^ Overapproximation of the synchronisation objects this thread closes over
+                                -> Unwinder s r                  -- ^ Exception handling continuation
+                                -> Pending s r }
 -- | We have to be able to throw several exceptions in succession because we can have more than one pending asynchronous exceptions.
 newtype Unwinder s r = Unwinder { unwind :: E.SomeException -> (E.MaskingState, Interruptibility, Unwinder s r, Pending s r) }
 
