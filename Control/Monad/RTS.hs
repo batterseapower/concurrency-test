@@ -391,59 +391,59 @@ myThreadId :: RTS s r (MC.ThreadId (RTS s r))
 myThreadId = RTS $ \k tid  _masking _suspendeds _throw -> k tid
 
 
--- TODO: I could detect more unreachable states if I find that a RTSVar currently blocking a Pending gets GCed
-data RTSVar s r a = RTSVar {
-    rtsvar_data :: STRef s (Maybe a),
+-- TODO: I could detect more unreachable states if I find that a MVar currently blocking a Pending gets GCed
+data MVar s r a = MVar {
+    mvar_data :: STRef s (Maybe a),
     -- MVars have guaranteed FIFO semantics, hence the queues
-    rtsvar_putters :: STQ.STQueue s (STQ.Location s (Suspended s r), a, Resumable s r),
-    rtsvar_takers  :: STQ.STQueue s (STQ.Location s (Suspended s r), a -> Resumable s r)
+    mvar_putters :: STQ.STQueue s (STQ.Location s (Suspended s r), a, Resumable s r),
+    mvar_takers  :: STQ.STQueue s (STQ.Location s (Suspended s r), a -> Resumable s r)
   }
 
-newEmptyRTSVar :: RTS s r (RTSVar s r a)
-newEmptyRTSVar = newRTSVarInternal Nothing
+newEmptyMVar :: RTS s r (MVar s r a)
+newEmptyMVar = newMVarInternal Nothing
 
-newRTSVar :: a -> RTS s r (RTSVar s r a)
-newRTSVar = newRTSVarInternal . Just
+newMVar :: a -> RTS s r (MVar s r a)
+newMVar = newMVarInternal . Just
 
-newRTSVarInternal :: Maybe a -> RTS s r (RTSVar s r a)
-newRTSVarInternal mb_x = RTS $ \k _tid _masking _suspendeds _throw -> Pending $ \resumables next_tid scheduler -> do
+newMVarInternal :: Maybe a -> RTS s r (MVar s r a)
+newMVarInternal mb_x = RTS $ \k _tid _masking _suspendeds _throw -> Pending $ \resumables next_tid scheduler -> do
     data_ref <- newSTRef mb_x
     putter_queue <- STQ.new
     taker_queue <- STQ.new
-    -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
-    unPending (k (RTSVar data_ref putter_queue taker_queue)) resumables next_tid scheduler
+    -- NB: unPending legitimate here because newMVarInternal cannot have externally visible side effects
+    unPending (k (MVar data_ref putter_queue taker_queue)) resumables next_tid scheduler
 
-takeRTSVar :: RTSVar s r a -> RTS s r a
-takeRTSVar rtsvar = RTS $ \k tid masking suspendeds throw -> Pending $ \resumables next_tid scheduler -> do
-    dat <- readSTRef (rtsvar_data rtsvar)
+takeMVar :: MVar s r a -> RTS s r a
+takeMVar mvar = RTS $ \k tid masking suspendeds throw -> Pending $ \resumables next_tid scheduler -> do
+    dat <- readSTRef (mvar_data mvar)
     case dat of
-       -- NB: we must guarantee that the woken thread doing a putRTSVar (if any) completes its operation since takeMVar has this guarantee
+       -- NB: we must guarantee that the woken thread doing a putMVar (if any) completes its operation since takeMVar has this guarantee
       Just x  -> do
-          (dat', resumables') <- STQ.dequeue (rtsvar_putters rtsvar) >>= \it -> case it of
+          (dat', resumables') <- STQ.dequeue (mvar_putters mvar) >>= \it -> case it of
               Nothing                         -> return (Nothing, resumables)
               Just (interrupt_loc, x, putter) -> STQ.delete interrupt_loc >>= \(Just _) -> return (Just x, putter : resumables)
-          writeSTRef (rtsvar_data rtsvar) dat'
+          writeSTRef (mvar_data mvar) dat'
           scheduleM suspendeds ((tid, masking, throw, k x) : resumables') next_tid scheduler
       Nothing -> do
-          rec { success_loc <- STQ.enqueue (interrupt_loc, \x -> (tid, masking, throw, k x)) (rtsvar_takers rtsvar)
+          rec { success_loc <- STQ.enqueue (interrupt_loc, \x -> (tid, masking, throw, k x)) (mvar_takers mvar)
                 -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
               ; interrupt_loc <- flip STQ.enqueue suspendeds (tid, masking, Interrupter $ STQ.delete success_loc >>= \(Just _) -> return throw)
               ; return () }
           scheduleM suspendeds resumables next_tid scheduler
 
-putRTSVar :: RTSVar s r a -> a -> RTS s r ()
-putRTSVar rtsvar x = RTS $ \k tid masking suspendeds throw -> Pending $ \resumables next_tid scheduler -> do
-    dat <- readSTRef (rtsvar_data rtsvar)
+putMVar :: MVar s r a -> a -> RTS s r ()
+putMVar mvar x = RTS $ \k tid masking suspendeds throw -> Pending $ \resumables next_tid scheduler -> do
+    dat <- readSTRef (mvar_data mvar)
     case dat of
-       -- NB: we must guarantee that the woken thread doing a takeRTSVar (if any) completes its operation since putMVar has this guarantee
+       -- NB: we must guarantee that the woken thread doing a takeMVar (if any) completes its operation since putMVar has this guarantee
       Nothing -> do
-          (dat', resumables') <- STQ.dequeue (rtsvar_takers rtsvar) >>= \it -> case it of
+          (dat', resumables') <- STQ.dequeue (mvar_takers mvar) >>= \it -> case it of
               Nothing                            -> return (Just x, resumables)
               Just (interrupt_loc, mk_resumable) -> STQ.delete interrupt_loc >>= \(Just _) -> return (Nothing, mk_resumable x : resumables)
-          writeSTRef (rtsvar_data rtsvar) dat'
+          writeSTRef (mvar_data mvar) dat'
           scheduleM suspendeds ((tid, masking, throw, k ()) : resumables') next_tid scheduler
       Just x  -> do
-          rec { success_loc <- STQ.enqueue (interrupt_loc, x, (tid, masking, throw, k ())) (rtsvar_putters rtsvar)
+          rec { success_loc <- STQ.enqueue (interrupt_loc, x, (tid, masking, throw, k ())) (mvar_putters mvar)
                 -- If we are interrupted, an asynchronous exception won the race: make sure that the standard wakeup loses
               ; interrupt_loc <- flip STQ.enqueue suspendeds (tid, masking, Interrupter $ STQ.delete success_loc >>= \(Just _) -> return throw)
               ; return () }
@@ -453,30 +453,30 @@ putRTSVar rtsvar x = RTS $ \k tid masking suspendeds throw -> Pending $ \resumab
 example1 :: RTS s r Integer
 example1 = do
     yield
-    v <- newEmptyRTSVar
-    --putRTSVar v 3
-    putRTSVar v 3
+    v <- newEmptyMVar
+    --putMVar v 3
+    putMVar v 3
     yield
-    --takeRTSVar v
-    takeRTSVar v
+    --takeMVar v
+    takeMVar v
 
 example2 :: RTS s r Integer
 example2 = do
-    v_in <- newRTSVar 1336
-    v_out <- newEmptyRTSVar
+    v_in <- newMVar 1336
+    v_out <- newEmptyMVar
     _ <- forkIO $ do
-        x <- takeRTSVar v_in
+        x <- takeMVar v_in
         yield
-        putRTSVar v_out (x + 1)
-    takeRTSVar v_out
+        putMVar v_out (x + 1)
+    takeMVar v_out
 
 -- An example with a race: depending on scheduling, this either returns "Hello" or "World"
 example3 :: RTS s r String
 example3 = do
-    v <- newEmptyRTSVar
-    _ <- forkIO $ putRTSVar v "Hello"
-    _ <- forkIO $ putRTSVar v "World"
-    takeRTSVar v
+    v <- newEmptyMVar
+    _ <- forkIO $ putMVar v "Hello"
+    _ <- forkIO $ putMVar v "World"
+    takeMVar v
 
 
 testScheduleSafe :: Eq r => (forall s. RTS s r r) -> IO ()
