@@ -1,64 +1,40 @@
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DoRec #-}
+module Control.Monad.RTS where
 
-import Control.Arrow ((***), first, second)
 import Control.Applicative (Applicative(..))
-import Control.Monad
 import qualified Control.Exception as E
-
+import Control.Monad
+import qualified Control.Monad.Concurrent as MC
 import Control.Monad.ST
 import Control.Monad.ST.Class
-import Data.STRef
-import qualified Data.STQueue as STQ
+
+import Data.Foldable (Foldable(foldMap))
 import Data.List
 import Data.Monoid (Monoid(..))
-import Data.Foldable (Foldable(foldMap))
+import Data.STRef
+import qualified Data.STQueue as STQ
 import Data.Traversable (Traversable(traverse))
 import qualified Data.Traversable as Traversable
 import Data.Typeable (Typeable(..), mkTyCon, mkTyConApp)
-import qualified Data.Map as M
 
-import Test.LazySmallCheck
+import Debug.Trace
+
+import Test.LazySmallCheck hiding (Report(..))
 import Test.QuickCheck hiding (Success, Result, (><))
 import Test.QuickCheck.Gen
 
 import System.Random
-
-import Prelude hiding (catch)
-
-
-import qualified Control.Monad.Concurrent as MC
-
-
-import Debug.Trace
-
 import System.IO.Unsafe
 
+import Utilities
+import Prelude hiding (catch)
 
-instance Applicative (ST s) where
-    pure = return
-    (<*>) = ap
 
 instance Arbitrary StdGen where
     arbitrary = MkGen $ \gen _ -> gen
     shrink _ = []
 
-
-thd3 :: (a, b, c) -> c
-thd3 (_, _, c) = c
-
-fth4 :: (a, b, c, d) -> d
-fth4 (_, _, _, d) = d
-
-vth5 :: (a, b, c, d, e) -> e
-vth5 (_, _, _, _, e) = e
-
-pamf :: Functor f => f a -> (a -> b) -> f b
-pamf = flip fmap
-
-
-{-# NOINLINE exceptionTrace #-}
-exceptionTrace :: a -> a
-exceptionTrace x = unsafePerformIO (E.evaluate x `E.catch` (\e -> trace ("Exception in pure code: " ++ show (e :: E.SomeException)) $ E.throw e))
 
 -- I used to use unsafeIsEvaluated to decide where to put in "...", but that pruned too heavily because
 -- I couldn't show the schedule before it was actually poked on and those thunks turned into real values.
@@ -67,76 +43,15 @@ showsExplored :: (a -> ShowS) -> a -> ShowS
 showsExplored shows x = unsafePerformIO $ fmap (maybe (showString "...") shows) $ tryIf isLSCError (E.evaluate x)
   where
     -- Looked at the LSC code to see what sort of errors it was generating...
-    isLSCError (E.ErrorCall ('\0':msg)) = True
-    isLSCError _                        = False
+    isLSCError (E.ErrorCall ('\0':_)) = True
+    isLSCError _                      = False
     
     tryIf :: E.Exception e => (e -> Bool) -> IO a -> IO (Maybe a)
     tryIf p act = fmap (either (\() -> Nothing) Just) $ E.tryJust (\e -> guard (p e) >> return ()) act
 
 
-newtype Nat = Nat { unNat :: Int }
-            deriving (Eq, Ord)
-
-instance Show Nat where
-    show = show . unNat
-
 instance Serial Nat where
     series d = drawnFrom $ map Nat [0..d]
-
-instance Num Nat where
-    x + y = Nat (unNat x + unNat y)
-    x * y = Nat (unNat x * unNat y)
-    x - y | z < 0     = error $ "Subtracting the naturals " ++ show x ++ " and " ++ show y ++ " produced a negative answer"
-          | otherwise = Nat z
-      where z = unNat x - unNat y
-    negate (Nat 0) = Nat 0
-    negate x = error $ "Cannot negate the strictly-positive natural number " ++ show x
-    abs x = x
-    signum (Nat 0) = Nat 0
-    signum (Nat x) = Nat 1
-    fromInteger x | x < 0     = error $ "The integer " ++ show x ++ " was not a natural number"
-                  | otherwise = Nat (fromInteger x)
-
-instance Real Nat where
-    toRational = toRational . unNat
-
-instance Enum Nat where
-    succ x = Nat (succ (unNat x))
-    pred (Nat 0) = error "Cannot take the predecessor of the natural number 0"
-    pred x       = Nat (pred (unNat x))
-    toEnum x | x < 0     = error $ "Invalid argument to toEnum: " ++ show x
-             | otherwise = Nat x
-    fromEnum = unNat
-
-instance Integral Nat where
-    x `quot` y = Nat (unNat x `quot` unNat y)
-    x `rem` y = Nat (unNat x `rem` unNat y)
-    x `div` y = Nat (unNat x `div` unNat y)
-    x `mod` y = Nat (unNat x `mod` unNat y)
-    x `quotRem` y = (Nat *** Nat) (unNat x `quotRem` unNat y)
-    x `divMod` y = (Nat *** Nat) (unNat x `divMod` unNat y)
-    toInteger = toInteger . unNat
-
-instance Random Nat where
-    randomR (lo, hi) g = first Nat $ randomR (unNat lo, unNat hi) g
-    random g = first (Nat . abs) $ random g
-
-
-data Queue a = Queue [a] [a]
-
-emptyQueue :: Queue a
-emptyQueue = Queue [] []
-
-queue :: a -> Queue a -> Queue a
-queue x (Queue xs ys) = Queue (x : xs) ys
-
-dequeue :: Queue a -> Maybe (a, Queue a)
-dequeue (Queue xs     (y:ys)) = Just (y, Queue xs ys)
-dequeue (Queue []     [])     = Nothing
-dequeue (Queue (x:xs) [])     = Just (rev xs x [])
-  where
-    rev []     x acc = (x, Queue [] acc)
-    rev (y:ys) x acc = rev ys y (x:acc)
 
 
 data Stream a = a :< Stream a
@@ -172,13 +87,8 @@ instance Serial SchedulerStream where
         streamSeriesN n = cons (\n ss -> SS ((:<) n (unSS ss))) >< streamSeries' n >< streamSeriesN (n + 1)
 
 
-genericDeleteAt :: Num i => [a] -> i -> (a, [a])
-genericDeleteAt []     _ = error $ "genericDeleteAt: index too large for given list, or list null"
-genericDeleteAt (x:xs) n = if n == 0 then (x, xs) else second (x:) (genericDeleteAt xs (n - 1))
-
-
-newtype Scheduler = Scheduler { schedule :: forall s r.    Nat              -- ^ One less than the number of pending processes (n)
-                                                        -> (Scheduler, Nat) -- ^ Pending process to run, and the next scheduler (0-based index, so valid values are from 0 to n inclusive)
+newtype Scheduler = Scheduler { schedule :: Nat              -- ^ One less than the number of pending processes (n)
+                                         -> (Scheduler, Nat) -- ^ Pending process to run, and the next scheduler (0-based index, so valid values are from 0 to n inclusive)
                               }
 
 unfair :: Scheduler
@@ -431,7 +341,7 @@ dequeueAsyncExceptionsOnBlocked (tid, masking, interrupter)
        Just (e, mb_resumable) -> do
           throw <- interrupt interrupter
           (pending, resumables) <- dequeueAsyncExceptions tid (unwind throw e)
-          return $ Just $ (tid, masking, throw, pending) : resumables
+          return $ Just $ (tid, masking, throw, pending) : maybe id (:) mb_resumable resumables
   | otherwise = return Nothing
 
 newtype Interrupter s r = Interrupter { interrupt :: ST s (Unwinder s r) } -- NB: must be used as a one-shot thing (once you grab the unwinder, the thread will be dumped from the suspended position and enqueued as pending by the user of Suspended)
@@ -492,7 +402,7 @@ newRTSVar = newRTSVarInternal . Just
 
 newRTSVarInternal :: Maybe a -> RTSM s r (RTSVar s r a)
 newRTSVarInternal mb_x = RTSM $ \k _tid _masking _suspendeds _throw -> Pending $ \resumables next_tid scheduler -> do
-    data_ref <- newSTRef Nothing
+    data_ref <- newSTRef mb_x
     putter_queue <- STQ.new
     taker_queue <- STQ.new
     -- NB: unPending legitimate here because newRTSVarInternal cannot have externally visible side effects
@@ -535,6 +445,7 @@ putRTSVar rtsvar x = RTSM $ \k tid masking suspendeds throw -> Pending $ \resuma
           scheduleM suspendeds resumables next_tid scheduler
 
 
+example1 :: RTSM s r Integer
 example1 = do
     yield
     v <- newEmptyRTSVar
@@ -544,20 +455,22 @@ example1 = do
     --takeRTSVar v
     takeRTSVar v
 
+example2 :: RTSM s r Integer
 example2 = do
     v_in <- newRTSVar 1336
     v_out <- newEmptyRTSVar
-    forkIO $ do
+    _ <- forkIO $ do
         x <- takeRTSVar v_in
         yield
         putRTSVar v_out (x + 1)
     takeRTSVar v_out
 
 -- An example with a race: depending on scheduling, this either returns "Hello" or "World"
+example3 :: RTSM s r String
 example3 = do
     v <- newEmptyRTSVar
-    forkIO $ putRTSVar v "Hello"
-    forkIO $ putRTSVar v "World"
+    _ <- forkIO $ putRTSVar v "Hello"
+    _ <- forkIO $ putRTSVar v "World"
     takeRTSVar v
 
 

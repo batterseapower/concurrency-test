@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-orphans -fno-warn-incomplete-patterns #-}
 -- | For documentation, see the paper "SmallCheck and Lazy SmallCheck:
 -- automatic exhaustive testing for small values" available at
 -- <http://www.cs.york.ac.uk/fp/smallcheck/>.  Several examples are
@@ -19,7 +20,7 @@ module Test.LazySmallCheck
   , cons4          -- :: ...
   , cons5          -- :: ...
   , Testable       -- :: class
-  , Report         -- :: * -> *
+  , Report(..)     -- :: * -> *
   , depthCheck     -- :: Testable a => Int -> a -> IO ()
   , depthCheck'    -- :: Testable a => Int -> a -> IO (Report a)
   , smallCheck     -- :: Testable a => Int -> a -> IO ()
@@ -37,7 +38,6 @@ module Test.LazySmallCheck
   )
   where
 
-import Monad
 import Control.Exception
 import System.Exit
 import Data.List (intercalate)
@@ -73,10 +73,10 @@ class Serial a where
 -- Series constructors
 
 cons :: a -> Series a
-cons a d = C (SumOfProd [[]]) [const a]
+cons a _d = C (SumOfProd [[]]) [const a]
 
 empty :: Series a
-empty d = C (SumOfProd []) []
+empty _d = C (SumOfProd []) []
 
 -- Bug:
 --   let it = cons (:<) >< (series :: Series Nat) >< it in it)
@@ -101,8 +101,8 @@ empty d = C (SumOfProd []) []
     cs = [\(x:xs) -> cf xs (conv cas x) | shallow, cf <- cfs]
     shallow = d > 0 -- && nonEmpty ta
 
-nonEmpty :: Type -> Bool
-nonEmpty (SumOfProd ps) = not (null ps)
+-- nonEmpty :: Type -> Bool
+-- nonEmpty (SumOfProd ps) = not (null ps)
 
 (\/) :: Series a -> Series a -> Series a
 (a \/ b) d = C (SumOfProd (ssa ++ ssb)) (ca ++ cb)
@@ -111,8 +111,8 @@ nonEmpty (SumOfProd ps) = not (null ps)
     C (SumOfProd ssb) cb = b d
 
 conv :: [[Term] -> a] -> Term -> a
-conv cs (Var p _) = error ('\0':map toEnum p)
-conv cs (Ctr i xs) = (cs !! i) xs
+conv _cs (Var p _) = error ('\0':map toEnum p)
+conv cs  (Ctr i xs) = (cs !! i) xs
 
 drawnFrom :: [a] -> Cons a
 drawnFrom xs = C (SumOfProd (map (const []) xs)) (map const xs)
@@ -208,11 +208,11 @@ new p ps = [ Ctr c (zipWith (\i t -> Var (p++[i]) t) [0..] ts)
 
 -- Find total instantiations of a partial value
 
-total :: Term -> [Term] 
-total val = tot val
-  where
-    tot (Ctr c xs) = [Ctr c ys | ys <- mapM tot xs] 
-    tot (Var p (SumOfProd ss)) = [y | x <- new p ss, y <- tot x]
+-- total :: Term -> [Term] 
+-- total val = tot val
+--   where
+--     tot (Ctr c xs) = [Ctr c ys | ys <- mapM tot xs] 
+--     tot (Var p (SumOfProd ss)) = [y | x <- new p ss, y <- tot x]
 
 -- Answers
 
@@ -236,7 +236,7 @@ refute r = ref (args r)
         unknown p = sumMapM ref 1 (refineList xs p)
 
 sumMapM :: (a -> IO (Report b)) -> Int -> [a] -> IO (Report b)
-sumMapM f n [] = return (Success n)
+sumMapM _f n [] = return (Success n)
 sumMapM f n (a:as) = seq n $ do
     report <- f a
     continueReport report (\m -> sumMapM f (n+m) as)
@@ -253,6 +253,7 @@ data Property =
 eval :: Property -> (Bool -> IO a) -> (Pos -> IO a) -> IO a
 eval p k u = answer p (\p -> eval' p k u) u
 
+eval' :: Property -> (Bool -> IO a) -> (Pos -> IO a) -> IO a
 eval' (Bool b) k u = answer b k u
 eval' (Neg p) k u = eval p (k . not) u
 eval' (And p q) k u = eval p (\b-> if b then eval q k u else k b) u
@@ -299,11 +300,11 @@ class Testable a where
 
 instance Testable Bool where
   type FailInfo Bool = ()
-  property apply = P $ \n d -> Result [] [] (\[] -> ()) (Bool . apply . reverse)
+  property apply = P $ \_n _d -> Result [] [] (\[] -> ()) (Bool . apply . reverse)
 
 instance Testable Property where
   type FailInfo Property = ()
-  property apply = P $ \n d -> Result [] [] (\[] -> ()) (apply . reverse)
+  property apply = P $ \_n _d -> Result [] [] (\[] -> ()) (apply . reverse)
 
 instance (Show a, Serial a, Testable b) => Testable (a -> b) where
   type FailInfo (a -> b) = (a, FailInfo b)

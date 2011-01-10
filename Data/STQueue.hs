@@ -96,20 +96,20 @@ delete (L location_i q) = do
         return (Just (value this))
 
 
-main :: IO ()
-main = print (runST test :: (Int, Int, Int, Int))
-  where
-    test = do
-      q <- new
-      enqueue 1 q
-      enqueue 2 q
-      Just x1 <- dequeue q
-      enqueue 3 q
-      loc4 <- enqueue 4 q
-      Just x2 <- dequeue q
-      enqueue 5 q
-      Just 4 <- delete loc4
-      Just x3 <- dequeue q
-      Just x4 <- dequeue q
-      Nothing <- dequeue q
-      return (x1, x2, x3, x4) -- (1, 2, 3, 5)
+-- main :: IO ()
+-- main = print (runST test :: (Int, Int, Int, Int))
+--   where
+--     test = do
+--       q <- new
+--       enqueue 1 q
+--       enqueue 2 q
+--       Just x1 <- dequeue q
+--       enqueue 3 q
+--       loc4 <- enqueue 4 q
+--       Just x2 <- dequeue q
+--       enqueue 5 q
+--       Just 4 <- delete loc4
+--       Just x3 <- dequeue q
+--       Just x4 <- dequeue q
+--       Nothing <- dequeue q
+--       return (x1, x2, x3, x4) -- (1, 2, 3, 5)
