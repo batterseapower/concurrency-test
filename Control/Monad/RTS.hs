@@ -198,6 +198,7 @@ instance Eq a => Monoid (SetEq a) where
 -- scheduleM gives QuickCheck a chance to try other schedulings, whereas using unPending forces control
 -- flow to continue in the current thread.
 type Resumable s r = (ThreadId s r, Unwinder s r, Pending s r)
+type Suspended s r = (ThreadId s r, Unwinder s r)
 newtype Pending s r = Pending { unPending :: [Resumable s r]        -- ^ Runnable threads that are eligible for execution, and their multi-step unwinders. Everything in this list is Uninterruptible.
                                           -> Nat                    -- ^ Next ThreadId to allocate
                                           -> Scheduler              -- ^ Current scheduler, used for at the next rescheduling point
@@ -408,8 +409,6 @@ dequeueAsyncExceptionsOnBlocked (tid, throw) = do
           Just (e, mb_resumable) -> do
              (pending, resumables) <- unchecked_unwind e >>= dequeueAsyncExceptions tid
              return $ Just $ (tid, throw, pending) : maybe id (:) mb_resumable resumables
-
-type Suspended s r = (ThreadId s r, Unwinder s r)
 
 data ThreadId s r = ThreadId Nat (STRef s (Queue (E.SomeException, STRef s (Maybe (ST s (Resumable s r))))))
 
