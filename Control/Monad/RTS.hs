@@ -231,8 +231,8 @@ type Blocked s r = Thread s r
 type Pending s r = Pending' s r (Result r)
 
 -- | Generalised pending corountine (a reader monad)
-newtype Pending' s r a = Pending { unPending :: ([Unblocked s r] -> Nat -> ST s (Result r)) -- ^ Rescheduling continuation: used whenever we are about to block on something
-                                             -> Nat                                         -- ^ Next ThreadId to allocate (TODO: extract monad structure w/ the continuation above?)
+newtype Pending' s r a = Pending { unPending :: ([(SyncObject s r, Unblocked s r)] -> Nat -> ST s (Result r)) -- ^ Rescheduling continuation: used whenever we are about to block on something
+                                             -> Nat                                                           -- ^ Next ThreadId to allocate (TODO: extract monad structure w/ the continuation above?)
                                              -> ST s a }
 
 instance Functor (Pending' s r) where
@@ -246,7 +246,8 @@ instance Monad (Pending' s r) where
     return x = liftST (return x)
     mx >>= fxmy = Pending $ \k_schedule next_tid -> unPending mx k_schedule next_tid >>= \x -> unPending (fxmy x) k_schedule next_tid
 
-reschedule :: [Unblocked s r] -> Pending s r
+-- FIXME: use this instead of 'prepare' when appropriate
+reschedule :: [(SyncObject s r, Unblocked s r)] -> Pending s r
 reschedule unblockeds = Pending $ \k_schedule next_tid -> k_schedule unblockeds next_tid
 
 instance MonadST (Pending' s r) where
@@ -335,7 +336,7 @@ getMaskingState :: RTS s r E.MaskingState
 getMaskingState = RTS $ \k _blockeds (syncobjs, (_tid, throw)) -> k (syncobjs, masking throw)
 
 maskWith :: Interruptibility -> ((forall a. RTS s r a -> RTS s r a) -> RTS s r b) -> RTS s r b
-maskWith interruptible while = RTS $ \k blockeds (syncobjs, (tid, throw)) -> unRTS (while (\unmask -> RTS $ \k' blockeds' (syncobjs', (tid', throw')) -> unRTS unmask k' blockeds' (syncobjs', (tid', throw' { masking = masking throw })))) (\b -> reschedule [((tid, throw), k b)]) blockeds (syncobjs, (tid, throw `maskUnwinder` interruptible))
+maskWith interruptible while = RTS $ \k blockeds (syncobjs, (tid, throw)) -> unRTS (while (\unmask -> RTS $ \k' blockeds' (syncobjs', (tid', throw')) -> unRTS unmask k' blockeds' (syncobjs', (tid', throw' { masking = masking throw })))) (\b -> prepare [((tid, throw), k b)]) blockeds (syncobjs, (tid, throw `maskUnwinder` interruptible))
     -- NB: must call scheduleM after exiting the masked region so we can pump asynchronous exceptions that may have accrued while masked
     -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump which are *newly enabled*
     -- by the transition in masking states: this would help reduce the scheduler search space
@@ -366,7 +367,7 @@ catch mx handle = RTS $ \k blockeds (syncobjs, (tid, throw)) -> unRTS mx k block
 -- does not call any RTS primitive that gives up control to the scheduler. For such computations, you need to manually add a
 -- call to 'yield' to allow the scheduler to interrupt the loop.
 yield :: RTS s r ()
-yield = RTS $ \k _blockeds (syncobjs, thread) -> reschedule [(thread, k (syncobjs, ()))]
+yield = RTS $ \k _blockeds (syncobjs, thread) -> prepare [(thread, k (syncobjs, ()))]
   -- It is certainly enough to yield on every bind operation. But this is too much (and it breaks the monad laws).
   -- Quviq/PULSE yields just before every side-effecting operation. I think we can just yield after every side-effecting
   -- operation and get the same results.
@@ -374,7 +375,7 @@ yield = RTS $ \k _blockeds (syncobjs, thread) -> reschedule [(thread, k (syncobj
 
 -- TODO: rethink treatment of asynchronous exceptions.. for one thing we are not generating enough schedulings
 -- TODO: it might be cool to have a mode that generates random asynchronous exceptions to try to crash other threads
-scheduleM :: Scheduler -> STQ.STQueue s (Blocked s r) -> [Unblocked s r] -> Nat -> ST s (Result r)
+scheduleM :: Scheduler -> STQ.STQueue s (Blocked s r) -> [(SyncObject s r, Unblocked s r)] -> Nat -> ST s (Result r)
 scheduleM scheduler blockeds unblockeds next_tid = do
     -- Deliver asynchronous exceptions to suspended threads (if they have any such exceptions pending).
     -- This is the only mechanism that lets such threads wake up, bar the blocking call resuming normally.
@@ -390,7 +391,7 @@ scheduleM scheduler blockeds unblockeds next_tid = do
           (pending, unblockeds'') <- dequeueAsyncExceptions (thread, pending)
           unPending pending (\unblockeds''' -> scheduleM scheduler' blockeds (unblockeds'' ++ unblockeds' ++ unblockeds''')) next_tid
         where (scheduler', i) = schedule scheduler (genericLength unblockeds - 1)
-              ((thread, pending), unblockeds') = genericDeleteAt unblockeds i
+              ((_syncobj, (thread, pending)), unblockeds') = genericDeleteAt unblockeds i
 
 
 newtype WriterST s m a = WriterST { runWriterST :: ST s (a, m) }
@@ -420,13 +421,13 @@ tell m = WriterST $ return ((), m)
 instance MonadST (RTS s r) where
     type StateThread (RTS s r) = s
     liftST st = RTS $ \k _blockeds (syncobjs, _thread) -> Pending $ \k_schedule next_tid -> st >>= \x -> unPending (k (syncobjs, x)) k_schedule next_tid
-        
+
 canThrow :: E.MaskingState -> Interruptibility -> Bool
 canThrow E.Unmasked            _             = True
 canThrow E.MaskedInterruptible Interruptible = True
 canThrow _                     _             = False
 
-dequeueAsyncExceptions :: Unblocked s r -> ST s (Pending s r, [Unblocked s r])
+dequeueAsyncExceptions :: Unblocked s r -> ST s (Pending s r, [(SyncObject s r, Unblocked s r)])
 dequeueAsyncExceptions = go []
   where
     -- TODO: currently I always unwind absolutely every available exception.
@@ -440,10 +441,10 @@ dequeueAsyncExceptions = go []
           case mb_e of
              -- No exception available to actually unwind with
             Nothing                -> return (pending, unblockeds)
-            Just (e, mb_resumable) -> unchecked_unwind e >>= go (maybe id (:) mb_resumable unblockeds)
+            Just (e, mb_resumable) -> unchecked_unwind e >>= go (maybe id (undefined {- FIXME -} (:)) mb_resumable unblockeds)
 
 -- TODO: currently I always unwind a pending exception. Similarly to above, I could choose not to unwind for a little bit
-dequeueAsyncExceptionsOnBlocked :: Blocked s r -> ST s (Maybe [Unblocked s r])
+dequeueAsyncExceptionsOnBlocked :: Blocked s r -> ST s (Maybe [(SyncObject s r, Unblocked s r)])
 dequeueAsyncExceptionsOnBlocked thread@(tid, _) = do
     case unwindAsync thread Interruptible of
        -- Cannot unwind this (blocked) thread right now due to masking
@@ -455,7 +456,7 @@ dequeueAsyncExceptionsOnBlocked thread@(tid, _) = do
           Nothing                -> return Nothing
           Just (e, mb_resumable) -> do
              (pending, unblockeds) <- unchecked_unwind e >>= dequeueAsyncExceptions
-             return $ Just $ (thread, pending) : maybe id (:) mb_resumable unblockeds
+             return $ Just $ (undefined {- FIXME -} (thread, pending)) : maybe id (:) (undefined {- FIXME -} mb_resumable) unblockeds
 
 data ThreadId s r = ThreadId Nat (STRef s (Queue (Closure s r E.SomeException, STRef s (Maybe (ST s (Unblocked s r))))))
 
@@ -494,8 +495,7 @@ forkIO forkable = RTS $ \k blockeds (syncobjs, thread@(_, Unwinder { masking = m
     tid' <- newThreadId next_tid
     let thread' = (tid', unhandledException masking)
         syncobjs' = SyncThreadId tid' `insertSetEq` syncobjs
-    -- TODO: don't need to introduce scheduling point??
-    k_schedule [(thread, k (syncobjs', tid')), (thread', unRTS forkable (\(_syncobjs, ()) -> Pending $ \k_schedule -> k_schedule []) blockeds (syncobjs', thread'))] (next_tid + 1)
+    unPending (prepare [(thread, k (syncobjs', tid')), (thread', unRTS forkable (\(_syncobjs, ()) -> Pending $ \k_schedule -> k_schedule []) blockeds (syncobjs', thread'))]) k_schedule (next_tid + 1)
 
 myThreadId :: RTS s r (MC.ThreadId (RTS s r))
 myThreadId = RTS $ \k _blockeds (syncobjs, (tid, _throw)) -> k (syncobjs, tid)
@@ -540,7 +540,7 @@ takeMVar mvar = RTS $ \k blockeds (syncobjs, (tid, throw)) -> Pending $ \k_sched
               Nothing            -> return (Nothing, Nothing)
               Just interrupt_act -> fmap (Just *** Just) interrupt_act
           writeSTRef (mvar_data mvar) dat'
-          k_schedule (((tid, throw), k (syncobjs, x)) : maybeToList mb_unblocked) next_tid
+          unPending (prepare (((tid, throw), k (syncobjs, x)) : maybeToList mb_unblocked)) k_schedule next_tid
       Nothing -> do
           _ <- mfix $ \interrupt_act -> do
               success_loc <- STQ.enqueue interrupt_act (mvar_takers mvar)
@@ -559,7 +559,7 @@ putMVar mvar x = RTS $ \k blockeds (syncobjs, (tid, throw)) -> Pending $ \k_sche
               Nothing            -> return (Just x, Nothing)
               Just interrupt_act -> fmap (((,) Nothing) . Just) (interrupt_act (syncobjs, x))
           writeSTRef (mvar_data mvar) dat'
-          k_schedule (((tid, throw), k (syncobjs, ())) : maybeToList mb_unblocked) next_tid
+          unPending (prepare (((tid, throw), k (syncobjs, ())) : maybeToList mb_unblocked)) k_schedule next_tid
       Just x  -> do
           _ <- mfix $ \interrupt_act -> do
               success_loc <- STQ.enqueue interrupt_act (mvar_putters mvar)
@@ -567,6 +567,13 @@ putMVar mvar x = RTS $ \k blockeds (syncobjs, (tid, throw)) -> Pending $ \k_sche
               interrupt_loc <- flip STQ.enqueue blockeds (tid, throw { uncheckedUnwind = \e -> STQ.delete success_loc >>= \(Just _) -> uncheckedUnwind throw e })
               return $ STQ.delete interrupt_loc >>= \(Just _) -> return (x, ((tid, throw), k (syncobjs, ())))
           k_schedule [] next_tid
+
+
+prepare :: [Unblocked s r] -> Pending s r
+prepare = go []
+  where
+    go syncobjs_unblockeds []                        = Pending $ \k_schedule next_tid -> k_schedule syncobjs_unblockeds next_tid
+    go syncobjs_unblockeds ((_thread, pending):rest) = Pending $ \k_schedule next_tid -> unPending pending (\syncobjs_unblockeds' next_tid' -> unPending (go (syncobjs_unblockeds' ++ syncobjs_unblockeds) rest) k_schedule next_tid') next_tid
 
 
 example1 :: RTS s r Integer
