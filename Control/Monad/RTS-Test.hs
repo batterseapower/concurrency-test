@@ -12,35 +12,36 @@ newtype ThreadId = TID Int
                  deriving (Show)
 
 
-newtype Unblocked s r = Unblocked { unUnblocked :: ([Unblocked s r] -> Int -> ST s (Result r))
-                                                -> Int -- Next TID
-                                                -> ST s (Result r) }
+newtype Unblocked' s r a = Unblocked { unUnblocked :: ([Unblocked s r] -> Int -> ST s (Result r))
+                                                   -> Int -- Next TID
+                                                   -> ST s a }
 
-newtype RTS s r a = RTS { unRTS :: (a
-                                    -> ([Unblocked s r] -> Int -> ST s (Result r))
-                                    -> Int -- Next TID
-                                    -> ST s (Result r))
-                                -> ([Unblocked s r]
-                                    -> Int -- Next TID
-                                    -> ST s (Result r))
+instance Monad (Unblocked' s r) where
+    return x = Unblocked $ \_k_may_block _tid -> return x
+    mx >>= fxmy = Unblocked $ \k_may_block tid -> unUnblocked mx k_may_block tid >>= \x -> unUnblocked (fxmy x) k_may_block tid
+
+reschedule :: [Unblocked s r] -> Unblocked s r
+reschedule unblockeds = Unblocked $ \k_may_block next_tid -> k_may_block unblockeds next_tid
+
+type Unblocked s r = Unblocked' s r (Result r)
+newtype RTS s r a = RTS { unRTS :: (a -> Unblocked s r)
                                 -> ThreadId -- My TID
-                                -> Int -- Next TID
-                                -> ST s (Result r) }
+                                -> Unblocked s r }
 
 instance Monad (RTS s r) where
-    return x = RTS $ \k_done k_may_block _tid next_tid -> k_done x k_may_block next_tid
-    mx >>= fxmy = RTS $ \k_done k_may_block tid next_tid -> unRTS mx (\x k_may_block next_tid -> unRTS (fxmy x) k_done k_may_block tid next_tid) k_may_block tid next_tid
+    return x = RTS $ \k_done _tid -> k_done x
+    mx >>= fxmy = RTS $ \k_done tid -> unRTS mx (\x -> unRTS (fxmy x) k_done tid) tid
 
 yield :: RTS s r ()
-yield = RTS $ \k_done k_may_block _tid next_tid -> trace ("Thread " ++ show _tid ++ " yielding") $ k_may_block [Unblocked $ \k_may_block next_tid -> k_done () k_may_block next_tid] next_tid
+yield = RTS $ \k_done _tid -> trace ("Thread " ++ show _tid ++ " yielding") $ reschedule [k_done ()]
 
-forkIO :: RTS s r () -> RTS s r Int -- NB: uses schedule directly because we wish to run both new threads until they reach a sync object operation
-forkIO rts = RTS $ \k_done k_may_block _tid next_tid -> k_may_block [Unblocked $ \k_may_block next_tid' -> k_done next_tid {- Return to caller -} k_may_block next_tid',
-                                                                     Unblocked $ \k_may_block next_tid' -> unRTS rts (\() k_may_block next_tid -> k_may_block [] next_tid) k_may_block (TID next_tid) {- Assign new ThreadIs -} next_tid']
-                                                                    (next_tid + 1)
+forkIO :: RTS s r () -> RTS s r Int
+forkIO rts = RTS $ \k_done _tid -> Unblocked $ \k_may_block next_tid -> k_may_block [k_done next_tid,
+                                                                                     unRTS rts (\() -> reschedule []) (TID next_tid)]
+                                                                                    (next_tid + 1)
 
 runRTS :: (forall s. RTS s r r) -> Result r
-runRTS rts = runST $ unRTS rts (\x _k_may_block _next_tid -> return (Good x)) schedule (TID 0) 1
+runRTS rts = runST $ unUnblocked (unRTS rts (\x -> return (Good x)) (TID 0)) schedule 1
   where
     -- Dummy impl:
     schedule :: [Unblocked s r] -> Int -> ST s (Result r)
