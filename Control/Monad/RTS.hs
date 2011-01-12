@@ -265,7 +265,7 @@ data Unwinder s r = Unwinder {
     -- | The ST action be used as a one-shot thing. For blocked threads, once you run the ST action (to deliver an asynchronous exception), the thread
     -- will be dumped from the suspended position and enqueued as pending by the user of Blocked
     uncheckedUnwind :: Closure s r E.SomeException
-                    -> ST s (ThreadId s r -> Unblocked s r) -- After unwinding we actually always resume on the same thread -- the ThreadId business is a nice hack to reuse Unblocked
+                    -> ST s (ThreadId s r -> Pending s r) -- After unwinding we actually always resume on the same thread -- the ThreadId business is a nice hack to reuse Unblocked
   }
 
 maskUnwinder :: Unwinder s r -> Interruptibility -> Unwinder s r
@@ -274,10 +274,10 @@ maskUnwinder throw Uninterruptible = throw { masking = E.MaskedUninterruptible }
 
 
 unwindAsync :: Thread s r -> Interruptibility -> Maybe (Closure s r E.SomeException -> ST s (Pending s r))
-unwindAsync (tid, throw) interruptible = guard (canThrow (masking throw) interruptible) >> return (fmap (snd . ($ tid)) . uncheckedUnwind throw)
+unwindAsync (tid, throw) interruptible = guard (canThrow (masking throw) interruptible) >> return (fmap ($ tid) . uncheckedUnwind throw)
 
 unwindSync :: Thread s r -> Closure s r E.SomeException -> Pending s r
-unwindSync (tid, throw) clo_e = join $ liftST $ fmap (snd . ($ tid)) (uncheckedUnwind throw clo_e)
+unwindSync (tid, throw) clo_e = join $ liftST $ fmap ($ tid) (uncheckedUnwind throw clo_e)
 
 runRTS :: Scheduler -> (forall s. RTS s r r) -> Result r
 runRTS scheduler mx = runST $ do
@@ -288,7 +288,7 @@ runRTS scheduler mx = runST $ do
 unhandledException :: E.MaskingState -> Unwinder s r
 unhandledException masking = Unwinder {
     masking = masking,
-    uncheckedUnwind = \(_syncobjs, e) -> return (\tid -> ((tid, unhandledException E.Unmasked), return (UnhandledException e))) -- TODO: we only report the last unhandled exception. Could do better?
+    uncheckedUnwind = \(_syncobjs, e) -> return (\_tid -> return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
   }
 
 
@@ -356,7 +356,7 @@ throwTo target_tid e = RTS $ \k blockeds (syncobjs, thread@(tid, throw)) -> case
       reschedule []))]
 
 catch :: E.Exception e => RTS s r a -> (e -> RTS s r a) -> RTS s r a
-catch mx handle = RTS $ \k blockeds (syncobjs, (tid, throw)) -> unRTS mx k blockeds (syncobjs, (tid, throw { uncheckedUnwind = \(syncobjs', e) -> maybe (uncheckedUnwind throw (syncobjs', e)) (\e -> return (\tid -> let thread' = (tid, throw) in (thread', unRTS (handle e) k blockeds (syncobjs `mappend` syncobjs', thread')))) (E.fromException e) }))
+catch mx handle = RTS $ \k blockeds (syncobjs, (tid, throw)) -> unRTS mx k blockeds (syncobjs, (tid, throw { uncheckedUnwind = \(syncobjs', e) -> maybe (uncheckedUnwind throw (syncobjs', e)) (\e -> return (\tid -> unRTS (handle e) k blockeds (syncobjs `mappend` syncobjs', (tid, throw)))) (E.fromException e) }))
 
 -- | Give up control to the scheduler. Control is automatically given up to the scheduler after calling every RTS primitive
 -- which might have effects observable outside the current thread. This is enough to almost guarantee that there exists some
