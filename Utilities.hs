@@ -91,6 +91,10 @@ data Queue a = Queue [a] [a]
 emptyQueue :: Queue a
 emptyQueue = Queue [] []
 
+nullQueue :: Queue a -> Bool
+nullQueue (Queue [] []) = True
+nullQueue (Queue _  _)  = False
+
 queue :: a -> Queue a -> Queue a
 queue x (Queue xs ys) = Queue (x : xs) ys
 
@@ -101,3 +105,16 @@ dequeue (Queue (x:xs) [])     = Just (rev xs x [])
   where
     rev []     x acc = (x, Queue [] acc)
     rev (y:ys) x acc = rev ys y (x:acc)
+
+
+holes :: [a] -> [(a, [a])]
+holes []     = []
+holes (x:xs) = (x, xs) : [(x', x:xs') | (x', xs') <- holes xs]
+
+
+mapMaybeM :: Monad m => (a -> m (Maybe b)) -> [a] -> m [b]
+mapMaybeM f = go
+  where go []     = return []
+        go (x:xs) = do
+          mb_y <- f x
+          maybe id (\y -> liftM (y:)) mb_y (go xs)

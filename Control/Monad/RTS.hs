@@ -376,21 +376,23 @@ yield = RTS $ \k _blockeds (syncobjs, thread) -> reschedule [(Nothing, (thread, 
 -- TODO: it might be cool to have a mode that generates random asynchronous exceptions to try to crash other threads
 scheduleM :: Scheduler -> STQ.STQueue s (Blocked s r) -> [(Maybe (SyncObject s r), Unblocked s r)] -> Nat -> ST s (Result r)
 scheduleM scheduler blockeds unblockeds next_tid = do
-    -- Deliver asynchronous exceptions to suspended threads (if they have any such exceptions pending).
+    -- 1) We could continue by just stepping the unblockeds to their next yield point
+    let possibilities0 = [return (pending, unblockeds') | ((_syncobject, (_thread, pending)), unblockeds') <- holes unblockeds]
+    -- 2) We could continue by delivering asynchronous exceptions to the unblocked threads
+    possibilities1 <- flip mapMaybeM (holes unblockeds) $ \((_syncobject, (thread, _pending)), unblockeds') -> fmap (fmap (fmap (\possibility -> (possibility, unblockeds')))) $ dequeueAsyncException' Uninterruptible thread
+    -- 3) We could continue by delivering asynchronous exceptions to the blocked threads
     -- This is the only mechanism that lets such threads wake up, bar the blocking call resuming normally.
-    ((), unblockeds) <- runWriterST $ (>>) (tell unblockeds) $ flip STQ.mapMaybeM blockeds $ \suspended -> do
-        mb_unblockeds <- liftST $ dequeueAsyncExceptionsOnBlocked suspended
-        case mb_unblockeds of
-          Nothing         -> return (Just suspended)
-          Just unblockeds -> tell unblockeds >> return Nothing
-    case unblockeds of
+    current_blockeds <- STQ.toList blockeds
+    possibilities2 <- flip mapMaybeM current_blockeds $ \thread -> fmap (fmap (fmap (\possibility -> (possibility, unblockeds)))) $ dequeueAsyncException' Interruptible thread
+      -- Note that the resumed thing will take care of deleting this blocked entery from the queue
+    
+    -- Use a scheduling strategy to decide which of these possibilities we should try out:
+    case possibilities0 ++ possibilities1 ++ possibilities2 of
       [] -> return BlockedIndefinitely
-      _  -> do
-          -- Delivers asynchoronous exceptions to the chosen resumable ONLY
-          (pending, unblockeds'') <- dequeueAsyncExceptions (thread, pending)
-          unPending pending (\unblockeds''' -> scheduleM scheduler' blockeds (unblockeds'' ++ unblockeds' ++ unblockeds''')) next_tid
-        where (scheduler', i) = schedule scheduler (genericLength unblockeds - 1)
-              ((_syncobj, (thread, pending)), unblockeds') = genericDeleteAt unblockeds i
+      possibilities -> do
+          let (scheduler', i) = schedule scheduler (genericLength possibilities - 1)
+          (pending, unblockeds') <- possibilities `genericIndex` i
+          unPending pending (\unblockeds'' -> scheduleM scheduler' blockeds (unblockeds' ++ unblockeds'')) next_tid
 
 
 newtype WriterST s m a = WriterST { runWriterST :: ST s (a, m) }
@@ -426,36 +428,19 @@ canThrow E.Unmasked            _             = True
 canThrow E.MaskedInterruptible Interruptible = True
 canThrow _                     _             = False
 
-dequeueAsyncExceptions :: Unblocked s r -> ST s (Pending s r, [(Maybe (SyncObject s r), Unblocked s r)])
-dequeueAsyncExceptions = go []
-  where
-    -- TODO: currently I always unwind absolutely every available exception.
-    -- This might mask some bugs, so we might want to just unwind a (possibly empty) prefix.
-    go unblockeds (thread@(tid, _), pending) = do
-      case unwindAsync thread Uninterruptible of -- Uninterruptible because this Pending is always just suspended, not blocked!
-         -- Cannot unwind this thread right now due to masking
-        Nothing -> return (pending, unblockeds)
-        Just unchecked_unwind -> do
-          mb_e <- dequeueAsyncException tid
-          case mb_e of
-             -- No exception available to actually unwind with
-            Nothing                -> return (pending, unblockeds)
-            Just (e, mb_resumable) -> unchecked_unwind e >>= go (maybe id (undefined {- FIXME -} (:)) mb_resumable unblockeds)
-
--- TODO: currently I always unwind a pending exception. Similarly to above, I could choose not to unwind for a little bit
-dequeueAsyncExceptionsOnBlocked :: Blocked s r -> ST s (Maybe [(Maybe (SyncObject s r), Unblocked s r)])
-dequeueAsyncExceptionsOnBlocked thread@(tid, _) = do
-    case unwindAsync thread Interruptible of
+dequeueAsyncException' :: Interruptibility -> Thread s r -> ST s (Maybe (ST s (Pending s r)))
+dequeueAsyncException' interruptible thread@(tid, _) = do
+    case unwindAsync thread interruptible of
        -- Cannot unwind this (blocked) thread right now due to masking
       Nothing -> return Nothing
       Just unchecked_unwind -> do
-        mb_e <- dequeueAsyncException tid
-        case mb_e of
-           -- No exception available to actually unwind with
-          Nothing                -> return Nothing
-          Just (e, mb_resumable) -> do
-             (pending, unblockeds) <- unchecked_unwind e >>= dequeueAsyncExceptions
-             return $ Just $ (undefined {- FIXME -} (thread, pending)) : maybe id (:) (undefined {- FIXME -} mb_resumable) unblockeds
+        no_exceptions <- nullAsyncExceptions tid
+        if no_exceptions
+         then return Nothing
+         else return $ Just $ do
+          Just (e, mb_resumable) <- dequeueAsyncException tid
+          (_thread, pending) <- unchecked_unwind e
+          return $ prepare (maybe [pending] (\(_, resumed_pending) -> resumed_pending : [pending]) mb_resumable)
 
 data ThreadId s r = ThreadId Nat (STRef s (Queue (Closure s r E.SomeException, STRef s (Maybe (ST s (Unblocked s r))))))
 
@@ -480,6 +465,9 @@ enqueueAsyncException (ThreadId _ ref) e resumable notify_block_complete = do
     resumable_ref <- newSTRef $ Just $ notify_block_complete >> return resumable
     writeSTRef ref (queue (e, resumable_ref) asyncs)
     return $ readSTRef resumable_ref >>= \(Just _) -> writeSTRef resumable_ref Nothing
+
+nullAsyncExceptions :: ThreadId s r -> ST s Bool
+nullAsyncExceptions (ThreadId _ ref) = fmap nullQueue (readSTRef ref)
 
 dequeueAsyncException :: ThreadId s r -> ST s (Maybe (Closure s r E.SomeException, Maybe (Unblocked s r)))
 dequeueAsyncException (ThreadId _ ref) = do

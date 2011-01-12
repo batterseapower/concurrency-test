@@ -1,13 +1,15 @@
 module Data.STQueue (
     STQueue, Location,
-    new, enqueue, dequeue, delete,
-    mapMaybeM
+    new, Data.STQueue.null, enqueue, dequeue, delete,
+    toList, toListWithLocation, mapMaybeM
   ) where
 
 import Control.Monad
 import Control.Monad.ST
 import Control.Monad.ST.Class
 import Data.STRef
+
+import Utilities (pamf)
 
 
 -- Initiall based on a Haskell translation of <http://www.java-tips.org/java-se-tips/java.lang/linked-list-based-queue-implementation.html>
@@ -25,6 +27,11 @@ new = do
     next_location_ref <- newSTRef 0
     front_ref <- newSTRef Empty
     return $ MQ next_location_ref front_ref
+
+null :: STQueue s a -> ST s Bool
+null q = readSTRef (front_ref q) `pamf` \front -> case front of
+      Empty        -> True
+      NonEmpty _ _ -> False
 
 enqueue :: a -> STQueue s a -> ST s (Location s a)
 enqueue x q = do
@@ -62,6 +69,22 @@ dequeueWithLocation q = do
 
 replaceFront :: STQueue s a -> Maybe (Node s a) -> Node s a -> ST s ()
 replaceFront q mb_front back = writeSTRef (front_ref q) (maybe Empty (\front -> NonEmpty front back) mb_front)
+
+
+toList :: STQueue s a -> ST s [a]
+toList = fmap (map snd) . toListWithLocation
+
+toListWithLocation :: STQueue s a -> ST s [(Integer, a)]
+toListWithLocation q = do
+   mb_front <- readSTRef (front_ref q)
+   case mb_front of
+     Empty -> return []
+     NonEmpty front _back -> go [] front
+       where
+         go acc node = do
+            mb_backwards <- readSTRef (backwards_ref node)
+            let acc' = (location node, value node) : acc
+            maybe (return (reverse acc')) (\backwards -> go acc' backwards) mb_backwards
 
 
 mapMaybeM :: MonadST m => (a -> m (Maybe a)) -> STQueue (StateThread m) a -> m ()
