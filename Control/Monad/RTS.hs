@@ -273,8 +273,8 @@ maskUnwinder throw Interruptible   = throw { masking = case masking throw of E.M
 maskUnwinder throw Uninterruptible = throw { masking = E.MaskedUninterruptible }
 
 
-unwindAsync :: Thread s r -> Interruptibility -> Maybe (Closure s r E.SomeException -> ST s (Unblocked s r))
-unwindAsync (tid, throw) interruptible = guard (canThrow (masking throw) interruptible) >> return (fmap ($ tid) . uncheckedUnwind throw)
+unwindAsync :: Thread s r -> Interruptibility -> Maybe (Closure s r E.SomeException -> ST s (Pending s r))
+unwindAsync (tid, throw) interruptible = guard (canThrow (masking throw) interruptible) >> return (fmap (snd . ($ tid)) . uncheckedUnwind throw)
 
 unwindSync :: Thread s r -> Closure s r E.SomeException -> Pending s r
 unwindSync (tid, throw) clo_e = join $ liftST $ fmap (snd . ($ tid)) (uncheckedUnwind throw clo_e)
@@ -439,7 +439,7 @@ dequeueAsyncException' interruptible thread@(tid, _) = do
          then return Nothing
          else return $ Just $ do
           Just (e, mb_resumable) <- dequeueAsyncException tid
-          (_thread, pending) <- unchecked_unwind e
+          pending <- unchecked_unwind e
           return $ prepare (maybe [pending] (\(_, resumed_pending) -> resumed_pending : [pending]) mb_resumable)
 
 data ThreadId s r = ThreadId Nat (STRef s (Queue (Closure s r E.SomeException, STRef s (Maybe (ST s (Unblocked s r))))))
