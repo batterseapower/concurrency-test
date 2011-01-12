@@ -1,6 +1,10 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DeriveDataTypeable, StandaloneDeriving, ExistentialQuantification #-}
-module Control.Monad.RTS where
+module Control.Monad.RTS (
+    Scheduler, unfair, roundRobin, streamed,
+    RTS, runRTS,
+    testScheduleSafe
+  ) where
 
 -- Ideas:
 --  * It might be cool to have a mode that generates random asynchronous exceptions to try to crash other threads
@@ -395,30 +399,6 @@ scheduleM scheduler blockeds unblockeds next_tid = do
           unPending pending (\unblockeds'' -> scheduleM scheduler' blockeds (unblockeds' ++ unblockeds'')) next_tid
 
 
-newtype WriterST s m a = WriterST { runWriterST :: ST s (a, m) }
-
-instance Monoid m => Functor (WriterST s m) where
-    fmap = liftM
-
-instance Monoid m => Applicative (WriterST s m) where
-    pure = return
-    (<*>) = ap
-
-instance Monoid m => Monad (WriterST s m) where
-    return x = WriterST $ return (x, mempty)
-    mx >>= fxmy = WriterST $ do
-      (x, m1) <- runWriterST mx
-      (y, m2) <- runWriterST (fxmy x)
-      return (y, m1 `mappend` m2)
-
-instance Monoid m => MonadST (WriterST s m) where
-    type StateThread (WriterST s m) = s
-    liftST st = WriterST $ fmap (flip (,) mempty) st
-
-tell :: Monoid m => m -> WriterST s m ()
-tell m = WriterST $ return ((), m)
-
-
 instance MonadST (RTS s r) where
     type StateThread (RTS s r) = s
     liftST st = RTS $ \k _blockeds (syncobjs, _thread) -> Pending $ \k_schedule next_tid -> st >>= \x -> unPending (k (syncobjs, x)) k_schedule next_tid
@@ -485,6 +465,20 @@ forkIO forkable = RTS $ \k blockeds (syncobjs, (_, Unwinder { masking = masking 
 
 myThreadId :: RTS s r (MC.ThreadId (RTS s r))
 myThreadId = RTS $ \k _blockeds (syncobjs, (tid, _throw)) -> k (syncobjs, tid)
+
+
+instance MC.MonadMVar (RTS s r) where
+    type MC.MVar (RTS s r) = MVar s r
+    
+    newEmptyMVar = newEmptyMVar
+    newMVar = newMVar
+    
+    takeMVar = takeMVar
+    putMVar = putMVar
+    
+    tryTakeMVar = undefined
+    tryPutMVar = undefined
+    isEmptyMVar = undefined
 
 
 data MVar s r a = MVar {
@@ -561,8 +555,8 @@ prepare = go []
     go syncobjs_unblockeds (pending:rest) = Pending $ \k_schedule next_tid -> unPending pending (\syncobjs_unblockeds' next_tid' -> unPending (go (syncobjs_unblockeds' ++ syncobjs_unblockeds) rest) k_schedule next_tid') next_tid
 
 
-example1 :: RTS s r Integer
-example1 = do
+_example1 :: RTS s r Integer
+_example1 = do
     yield
     v <- newEmptyMVar
     --putMVar v 3
@@ -571,8 +565,8 @@ example1 = do
     --takeMVar v
     takeMVar v
 
-example2 :: RTS s r Integer
-example2 = do
+_example2 :: RTS s r Integer
+_example2 = do
     v_in <- newMVar 1336
     v_out <- newEmptyMVar
     _ <- forkIO $ do
@@ -582,8 +576,8 @@ example2 = do
     takeMVar v_out
 
 -- An example with a race: depending on scheduling, this either returns "Hello" or "World"
-example3 :: RTS s r String
-example3 = do
+_example3 :: RTS s r String
+_example3 = do
     v <- newEmptyMVar
     _ <- forkIO $ putMVar v "Hello"
     _ <- forkIO $ putMVar v "World"
@@ -600,12 +594,12 @@ testScheduleSafe act = test $ \ss -> trace (show ss) $ expected == runRTS (sched
   where expected = runRTS roundRobin act
 
 
-main :: IO ()
-main = do
+_main :: IO ()
+_main = do
     -- Demonstrates the presence of a data race - these two invocations return different results
-    print $ runRTS unfair example3
-    print $ runRTS roundRobin example3
+    print $ runRTS unfair _example3
+    print $ runRTS roundRobin _example3
 
     -- Let's see if we can find the race automatically!
-    testScheduleSafe example3
+    testScheduleSafe _example3
 
