@@ -2,6 +2,12 @@
 {-# LANGUAGE RankNTypes, GeneralizedNewtypeDeriving, TypeFamilies, DeriveDataTypeable, StandaloneDeriving, ExistentialQuantification #-}
 module Control.Monad.RTS where
 
+-- Ideas:
+--  * It might be cool to have a mode that generates random asynchronous exceptions to try to crash other threads
+--  * We have to be able to show failing schedulings in a nice way
+--  * I could detect more unreachable states if I find that a MVar currently blocking a Pending gets GCed
+
+
 import Control.Applicative (Applicative(..))
 import Control.Arrow ((***))
 import qualified Control.Exception as E
@@ -34,6 +40,7 @@ import Unsafe.Coerce (unsafeCoerce)
 
 import Utilities
 import Prelude hiding (catch)
+
 
 
 instance Arbitrary StdGen where
@@ -124,7 +131,7 @@ randomised gen = Scheduler schedule
           where (i, gen') = randomR (0, n) gen
 
 instance Show Scheduler where
-    show _ = "Scheduler" -- TODO: have to be able to show failing schedulings in a nice way
+    show _ = "Scheduler"
 
 instance Arbitrary Scheduler where
     arbitrary = fmap randomised arbitrary
@@ -232,7 +239,7 @@ type Pending s r = Pending' s r (Result r)
 
 -- | Generalised pending corountine (a reader monad)
 newtype Pending' s r a = Pending { unPending :: ([(Maybe (SyncObject s r), Unblocked s r)] -> Nat -> ST s (Result r)) -- ^ Rescheduling continuation: used whenever we are about to block on something (allow Nothing SyncObject for a yield call)
-                                             -> Nat                                                                   -- ^ Next ThreadId to allocate (TODO: extract monad structure w/ the continuation above?)
+                                             -> Nat                                                                   -- ^ Next ThreadId to allocate (NB: could extract reader monad structure w/ the continuation above?)
                                              -> ST s a }
 
 instance Functor (Pending' s r) where
@@ -288,7 +295,7 @@ runRTS scheduler mx = runST $ do
 unhandledException :: E.MaskingState -> Unwinder s r
 unhandledException masking = Unwinder {
     masking = masking,
-    uncheckedUnwind = \(_syncobjs, e) -> return (\_tid -> return (UnhandledException e)) -- TODO: we only report the last unhandled exception. Could do better?
+    uncheckedUnwind = \(_syncobjs, e) -> return (\_tid -> return (UnhandledException e)) -- We only report the last unhandled exception. Could we do something else?
   }
 
 
@@ -297,9 +304,7 @@ instance Functor (RTS s r) where
 
 instance Applicative (RTS s r) where
    pure = return
-   --(<*>) = ap
-   -- We can be more precise about how syncobjs flow for an Applicative computation:
-   -- TODO: could do rather better than this (more efficient) if the SyncObjs passed in the closure were just the *new ones*
+   -- We can be more precise about how syncobjs flow for an Applicative computation than if we just used `ap` directly. This helps trim the search space:
    mfxy <*> mx = RTS $ \k_y blockeds (syncobjs, (tid, throw)) -> unRTS mfxy (\(syncobjs_fxy, fxy) -> unRTS mx (\(syncobjs_x, x) -> k_y (syncobjs_fxy `unionSetEq` syncobjs_x, fxy x)) blockeds (syncobjs, (tid, throw))) blockeds (syncobjs, (tid, throw))
 
 instance Monad (RTS s r) where
@@ -336,9 +341,6 @@ getMaskingState = RTS $ \k _blockeds (syncobjs, (_tid, throw)) -> k (syncobjs, m
 
 maskWith :: Interruptibility -> ((forall a. RTS s r a -> RTS s r a) -> RTS s r b) -> RTS s r b
 maskWith interruptible while = RTS $ \k blockeds (syncobjs, (tid, throw)) -> reschedule [(Just (SyncThreadId tid), ((tid, throw), unRTS (while (\unmask -> RTS $ \k' blockeds' (syncobjs', (tid', throw')) -> unRTS unmask k' blockeds' (syncobjs', (tid', throw' { masking = masking throw })))) (\b -> prepare [k b]) blockeds (syncobjs, (tid, throw `maskUnwinder` interruptible))))]
-    -- NB: must call scheduleM after exiting the masked region so we can pump asynchronous exceptions that may have accrued while masked
-    -- TODO: I think it would be safe to do scheduleM iff there were actually some exceptions on this thread to pump which are *newly enabled*
-    -- by the transition in masking states: this would help reduce the scheduler search space
 
 throwIO :: E.Exception e => e -> RTS s r a
 throwIO e = RTS $ \_k _blockeds (syncobjs, thread) -> unwindSync thread (syncobjs, E.SomeException e)
@@ -372,8 +374,6 @@ yield = RTS $ \k _blockeds (syncobjs, thread) -> reschedule [(Nothing, (thread, 
   -- operation and get the same results.
 
 
--- TODO: rethink treatment of asynchronous exceptions.. for one thing we are not generating enough schedulings
--- TODO: it might be cool to have a mode that generates random asynchronous exceptions to try to crash other threads
 scheduleM :: Scheduler -> STQ.STQueue s (Blocked s r) -> [(Maybe (SyncObject s r), Unblocked s r)] -> Nat -> ST s (Result r)
 scheduleM scheduler blockeds unblockeds next_tid = do
     -- 1) We could continue by just stepping the unblockeds to their next yield point
@@ -487,7 +487,6 @@ myThreadId :: RTS s r (MC.ThreadId (RTS s r))
 myThreadId = RTS $ \k _blockeds (syncobjs, (tid, _throw)) -> k (syncobjs, tid)
 
 
--- TODO: I could detect more unreachable states if I find that a MVar currently blocking a Pending gets GCed
 data MVar s r a = MVar {
     mvar_data :: STRef s (Maybe a),
     -- MVars have guaranteed FIFO semantics, hence the queues
